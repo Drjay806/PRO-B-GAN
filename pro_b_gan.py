@@ -1704,7 +1704,7 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=1024, help='Hidden dimension for discriminator')
     
     # Training Parameters
-    parser.add_argument('--epochs', type=int, default=30, help='Total training epochs')
+    parser.add_argument('--epochs', type=int, default=200, help='Total training epochs')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--clip_norm', type=float, default=1.0, help='Gradient clipping norm')
     parser.add_argument('--g_lr', type=float, default=1e-3, help='Generator learning rate')
@@ -1737,7 +1737,7 @@ def main():
     parser.add_argument('--complex_regularization', type=float, default=0.01, help='ComplEx L2 regularization')
     
     # Three-Tier System
-    parser.add_argument('--pretrain_epochs', type=int, default=200, help='Tier 1 pretraining epochs')
+    parser.add_argument('--pretrain_epochs', type=int, default=70, help='Tier 1 pretraining epochs')
     parser.add_argument('--pretrain_patience', type=int, default=20, help='Tier 1 early stopping patience')
     parser.add_argument('--rl_start_epoch', type=int, default=20, help='Epoch to start RL training')
     parser.add_argument('--full_system_epoch', type=int, default=25, help='Epoch to start full adversarial training')
