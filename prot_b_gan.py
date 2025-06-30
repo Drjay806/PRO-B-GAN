@@ -973,37 +973,49 @@ def generate_balanced_hard_negatives(h_emb, r_emb, node_emb, num_hard=10, num_me
     
     return all_neg_idxs
 
-def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, rl_start_epoch, full_system_epoch):
-    """Three-tier RL loss progression"""
+def compute_composite_rl_loss(tier2_epoch, tier3_epoch, current_tier, h_emb, r_emb, fake, t_emb, discriminator, rl_start_epoch, full_system_epoch):
+    """Three-tier RL loss progression with explicit tier tracking"""
     
-    if epoch < rl_start_epoch:
+    if current_tier == 1:
         return torch.tensor(0.0, device=h_emb.device), {}
     
-    elif epoch < full_system_epoch:
+    elif current_tier == 2:
         # Tier 2: DistMult-only RL
+        if tier2_epoch < rl_start_epoch:
+            return torch.tensor(0.0, device=h_emb.device), {}
+        
         dm_scores = distmult_score(h_emb, r_emb, fake)
         dm_component = torch.sigmoid(dm_scores / 5.0)
         simple_reward = dm_component - 0.5
         rl_loss = -simple_reward.mean()
         return rl_loss, {'dm_component': dm_component.mean().item()}
     
-    else:
+    else:  # current_tier == 3
         # Tier 3: Full composite RL
-        dm_scores = distmult_score(h_emb, r_emb, fake)
-        dm_component = torch.sigmoid(dm_scores / 5.0)
-        
-        with torch.no_grad():
-            disc_scores = discriminator(h_emb.detach(), r_emb.detach(), fake.detach())
-            disc_component = torch.sigmoid(disc_scores)
-        
-        composite_reward = 0.3 * disc_component + 0.7 * dm_component - 0.5
-        rl_loss = -composite_reward.mean()
-        
-        return rl_loss, {
-            'disc_component': disc_component.mean().item(),
-            'dm_component': dm_component.mean().item(),
-            'composite_reward': composite_reward.mean().item()
-        }
+        if tier3_epoch < full_system_epoch:
+            # Still in transition, use DistMult only
+            dm_scores = distmult_score(h_emb, r_emb, fake)
+            dm_component = torch.sigmoid(dm_scores / 5.0)
+            simple_reward = dm_component - 0.5
+            rl_loss = -simple_reward.mean()
+            return rl_loss, {'dm_component': dm_component.mean().item()}
+        else:
+            # Full composite system
+            dm_scores = distmult_score(h_emb, r_emb, fake)
+            dm_component = torch.sigmoid(dm_scores / 5.0)
+            
+            with torch.no_grad():
+                disc_scores = discriminator(h_emb.detach(), r_emb.detach(), fake.detach())
+                disc_component = torch.sigmoid(disc_scores)
+            
+            composite_reward = 0.3 * disc_component + 0.7 * dm_component - 0.5
+            rl_loss = -composite_reward.mean()
+            
+            return rl_loss, {
+                'disc_component': disc_component.mean().item(),
+                'dm_component': dm_component.mean().item(),
+                'composite_reward': composite_reward.mean().item()
+            }
 
 def bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb):
     """Hub bias mitigation through hard negative mining"""
@@ -1038,7 +1050,7 @@ def rebalance_training_schedule(epoch, disc_f1):
     return d_update_freq, g_steps_per_d
 
 def evaluate_hit_at_k(data_loader, generator, node_emb, rel_emb, device, hit_at_k_list):
-    """Evaluate Hit@K metrics"""
+    """Evaluate Hit@K metrics with safety check for empty data"""
     generator.eval()
     hits_dict = {k: 0 for k in hit_at_k_list}
     total_examples = 0
@@ -1060,7 +1072,12 @@ def evaluate_hit_at_k(data_loader, generator, node_emb, rel_emb, device, hit_at_
                         hits_dict[k] += 1
             total_examples += len(t)
     
-    hit_at_k_ratios = {k: hits_dict[k] / total_examples for k in hit_at_k_list}
+    # Safety check for division by zero
+    if total_examples == 0:
+        hit_at_k_ratios = {k: 0.0 for k in hit_at_k_list}
+    else:
+        hit_at_k_ratios = {k: hits_dict[k] / total_examples for k in hit_at_k_list}
+    
     generator.train()
     return hit_at_k_ratios
 
@@ -1086,7 +1103,7 @@ def validate(val_loader, generator, discriminator, node_emb, rel_emb, device):
             val_cos_sim += F.cosine_similarity(fake, tail_embed).mean().item()
     
     val_metrics = compute_metrics(np.array(val_true_labels), np.array(val_pred_probs))
-    val_cos_avg = val_cos_sim / len(val_loader)
+    val_cos_avg = val_cos_sim / len(val_loader) if len(val_loader) > 0 else 0.0
     
     generator.train()
     discriminator.train()
@@ -1097,7 +1114,7 @@ def validate(val_loader, generator, discriminator, node_emb, rel_emb, device):
 # =============================================================================
 
 def train_prot_b_gan(args):
-    """Main training pipeline for Prot-B-GAN with user-configurable parameters"""
+    """Main training pipeline for Prot-B-GAN with fixed issues"""
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -1178,18 +1195,26 @@ def train_prot_b_gan(args):
             'real_acc_list': [], 'fake_acc_list': [],
             'collapse_hist': deque(maxlen=5), 'diversity_hist': deque(maxlen=5),
             'tier_transitions': []  
+        }
         
         # Training state with early stopping for each tier
         best_val_hit10 = 0.0
         best_epoch = 0
         
-        # Tier-specific early stopping
+        # Tier-specific early stopping and epoch tracking
         tier1_best = 0.0
         tier1_patience = 0
         tier2_best = 0.0  
         tier2_patience = 0
         tier3_best = 0.0
         tier3_patience = 0
+        
+        # Explicit tier epoch counters (FIXED: Simplified tier tracking)
+        tier1_start_epoch = 1
+        tier2_start_epoch = None
+        tier3_start_epoch = None
+        tier2_epoch_count = 0
+        tier3_epoch_count = 0
         
         best_pretrain_state = None
         current_tier = 1
@@ -1212,6 +1237,9 @@ def train_prot_b_gan(args):
         # =========================================================================
         
         for epoch in range(1, args.epochs + 1):
+            
+            # Initialize rl_metrics at epoch level (FIXED: Variable scope issue)
+            rl_metrics = {}
             
             # =================================================================
             # TIER 1: Enhanced Reconstruction Warm-up with Early Stopping
@@ -1280,7 +1308,8 @@ def train_prot_b_gan(args):
                     node_emb.requires_grad_(False)
                     g_opt = optim.Adam(generator.parameters(), lr=1e-4)
                     current_tier = 2
-                    training_history['tier_transitions'].append(('Tier 2', epoch))
+                    tier2_start_epoch = epoch + 1  # FIXED: Explicit tier tracking
+                    training_history['tier_transitions'].append(('Tier 2', epoch + 1))
                     
                     print_progress(">> Transitioning to Tier 2: Structure-aware RL", args.verbose)
                 continue
@@ -1289,10 +1318,19 @@ def train_prot_b_gan(args):
             # TIER 2 & 3: RL + Adversarial Training with Early Stopping
             # =================================================================
             
-            if current_tier == 2 and epoch == training_history['tier_transitions'][-1][1] + 1:
+            # FIXED: Simplified progress tracking
+            if current_tier == 2 and epoch == tier2_start_epoch:
                 progress_manager.start_tier(2, args.tier2_patience)
-            elif current_tier == 3 and len(training_history['tier_transitions']) >= 2 and epoch == training_history['tier_transitions'][-1][1] + 1:
+                tier2_epoch_count = 0
+            elif current_tier == 3 and epoch == tier3_start_epoch:
                 progress_manager.start_tier(3, args.tier3_patience)
+                tier3_epoch_count = 0
+            
+            # Update epoch counters
+            if current_tier == 2:
+                tier2_epoch_count += 1
+            elif current_tier == 3:
+                tier3_epoch_count += 1
             
             generator.train()
             discriminator.train()
@@ -1346,7 +1384,7 @@ def train_prot_b_gan(args):
                     d_opt.step()
                     total_d_loss += d_loss.item()
                     
-                    # Reset generator counter
+                    # Reset generator counter (FIXED: Removed redundant reset)
                     g_step_counter = 0
                     
                     # Track discriminator performance
@@ -1375,20 +1413,15 @@ def train_prot_b_gan(args):
                 dm_loss = -torch.tanh(dm_scores / 10.0).mean()
                 loss_components.append(args.distmult_weight * dm_loss)
                 
-                # RL loss (starts in Tier 2)
+                # RL loss (starts in Tier 2) - FIXED: Simplified epoch calculation
                 if current_tier >= 2:
-                    # Determine effective epoch for RL (starts from when Tier 2 begins)
-                    tier2_start = training_history['tier_transitions'][-1][1] if training_history['tier_transitions'] else args.rl_start_epoch
-                    effective_rl_epoch = epoch - tier2_start + args.rl_start_epoch
-                    
-                    if current_tier == 3:
-                        effective_rl_epoch = epoch - training_history['tier_transitions'][-1][1] + args.full_system_epoch
-                    
-                    rl_loss, rl_metrics = compute_composite_rl_loss(effective_rl_epoch, h_emb, r_emb_batch, fake, t_emb, discriminator, args.rl_start_epoch, args.full_system_epoch)
+                    rl_loss, rl_metrics = compute_composite_rl_loss(
+                        tier2_epoch_count, tier3_epoch_count, current_tier, 
+                        h_emb, r_emb_batch, fake, t_emb, discriminator, 
+                        args.rl_start_epoch, args.full_system_epoch
+                    )
                     if rl_loss.item() != 0:
                         loss_components.append(args.rl_weight * rl_loss)
-                else:
-                    rl_metrics = {}
                 
                 # Bias mitigation
                 bias_loss = bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb_batch)
@@ -1434,10 +1467,6 @@ def train_prot_b_gan(args):
                 
                 # Track generator steps for dynamic scheduling
                 g_step_counter += 1
-                
-                # Reset generator counter when discriminator trains
-                if current_tier == 3 and step % current_d_freq == 0 and g_step_counter >= current_g_steps:
-                    g_step_counter = 0
                 
                 # Track training metrics
                 with torch.no_grad():
@@ -1509,7 +1538,8 @@ def train_prot_b_gan(args):
                     print_progress(f"[Tier 2] Early stopping at epoch {epoch} - transitioning to Tier 3", args.verbose)
                     progress_manager.close_tier(2)
                     current_tier = 3
-                    training_history['tier_transitions'].append(('Tier 3', epoch))
+                    tier3_start_epoch = epoch + 1  # FIXED: Explicit tier tracking
+                    training_history['tier_transitions'].append(('Tier 3', epoch + 1))
                     should_transition = True
             
             elif current_tier == 3:
@@ -1535,7 +1565,7 @@ def train_prot_b_gan(args):
             
             if args.verbose:
                 rl_info = ""
-                if current_tier >= 2 and 'rl_metrics' in locals():
+                if current_tier >= 2 and rl_metrics:  # FIXED: Check if rl_metrics has content
                     if current_tier == 2:
                         rl_info = f" | RL_DM: {rl_metrics.get('dm_component', 0):.3f}"
                     else:
@@ -1575,7 +1605,7 @@ def train_prot_b_gan(args):
                     "entity_to_id": entity_to_id,
                     "relation_to_id": relation_to_id,
                     "training_history": training_history,
-                    "final_rl_metrics": rl_metrics if current_tier >= 2 and 'rl_metrics' in locals() else {},
+                    "final_rl_metrics": rl_metrics,
                     "final_disc_metrics": disc_metrics
                 }
                 
@@ -1597,12 +1627,15 @@ def train_prot_b_gan(args):
         print(f"Final tier reached: {current_tier}")
         print(f"{'='*70}")
         
-        # Load best model for final evaluation
+        # Load best model for final evaluation (FIXED: Complete checkpoint loading)
         checkpoint_path = os.path.join(args.output_dir, "best_prot_b_gan_checkpoint.pt")
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
             generator.load_state_dict(checkpoint['generator'])
             discriminator.load_state_dict(checkpoint['discriminator'])
+            # FIXED: Load all components
+            node_emb.data.copy_(checkpoint['node_emb'].to(device))
+            rel_emb.load_state_dict(checkpoint['rel_emb'])
         
         # Final test evaluation
         test_hit_at_k = evaluate_hit_at_k(test_loader, generator, node_emb, rel_emb, device, args.hit_at_k)
@@ -1665,12 +1698,12 @@ def main():
     parser.add_argument('--test_file', type=str, default='test.csv', help='Test data file (CSV)')
     parser.add_argument('--output_dir', type=str, default='./prot_b_gan_output', help='Output directory for results')
     
-    # Model Architecture (YOUR ORIGINAL DEFAULTS)
+    # Model Architecture
     parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
     parser.add_argument('--noise_dim', type=int, default=64, help='Noise dimension for generator')
     parser.add_argument('--hidden_dim', type=int, default=1024, help='Hidden dimension for discriminator')
     
-    # Training Parameters (YOUR ORIGINAL DEFAULTS)
+    # Training Parameters
     parser.add_argument('--epochs', type=int, default=30, help='Total training epochs')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--clip_norm', type=float, default=1.0, help='Gradient clipping norm')
@@ -1682,7 +1715,7 @@ def main():
                         choices=['rgcn', 'random', 'transe', 'distmult', 'complex'],
                         help='Embedding initialization method')
     
-    # R-GCN Parameters (YOUR ORIGINAL DEFAULTS)
+    # R-GCN Parameters
     parser.add_argument('--rgcn_epochs', type=int, default=50, help='R-GCN preprocessing epochs')
     parser.add_argument('--rgcn_lr', type=float, default=0.01, help='R-GCN learning rate')
     parser.add_argument('--rgcn_layers', type=int, default=2, help='Number of R-GCN layers')
@@ -1703,19 +1736,18 @@ def main():
     parser.add_argument('--complex_lr', type=float, default=0.01, help='ComplEx learning rate')
     parser.add_argument('--complex_regularization', type=float, default=0.01, help='ComplEx L2 regularization')
     
-    # Three-Tier System (YOUR ORIGINAL DEFAULTS)
+    # Three-Tier System
     parser.add_argument('--pretrain_epochs', type=int, default=200, help='Tier 1 pretraining epochs')
     parser.add_argument('--pretrain_patience', type=int, default=20, help='Tier 1 early stopping patience')
     parser.add_argument('--rl_start_epoch', type=int, default=20, help='Epoch to start RL training')
     parser.add_argument('--full_system_epoch', type=int, default=25, help='Epoch to start full adversarial training')
     
-    # Early Stopping (YOUR ORIGINAL DEFAULTS)
+    # Early Stopping
     parser.add_argument('--early_stopping_patience', type=int, default=20, help='General early stopping patience')
     parser.add_argument('--tier2_patience', type=int, default=20, help='Tier 2 early stopping patience')
     parser.add_argument('--tier3_patience', type=int, default=25, help='Tier 3 early stopping patience')
     
-    # Loss Weights (YOUR ORIGINAL DEFAULTS)
-    parser.add_argument('--lambda_distmult', type=float, default=1.0, help='DistMult loss weight')
+    # Loss Weights
     parser.add_argument('--g_guidance_weight', type=float, default=2.0, help='Generator guidance weight')
     parser.add_argument('--l2_reg_weight', type=float, default=0.1, help='L2 regularization weight')
     parser.add_argument('--refinement_weight', type=float, default=0.7, help='Refinement loss weight')
@@ -1724,16 +1756,11 @@ def main():
     parser.add_argument('--bias_weight', type=float, default=0.1, help='Bias mitigation weight')
     parser.add_argument('--adv_weight', type=float, default=0.05, help='Adversarial loss weight')
     
-    # Hard Negative Mining (YOUR ORIGINAL DEFAULTS)
+    # Hard Negative Mining
     parser.add_argument('--n_neg', type=int, default=50, help='Number of negative samples')
     parser.add_argument('--hard_neg_k', type=int, default=50, help='Number of hard negatives')
     parser.add_argument('--n_pre_neg', type=int, default=30, help='Number of pretraining negatives')
     parser.add_argument('--alpha_pretrain', type=float, default=1.5, help='Pretraining alpha weight')
-    
-    # Your Original Parameters
-    parser.add_argument('--direct_disc_weight', type=float, default=0.5, help='Direct discriminator weight')
-    parser.add_argument('--hard_neg_margin', type=float, default=0.5, help='Hard negative margin')
-    parser.add_argument('--disc_hard_neg_ratio', type=float, default=0.5, help='Discriminator hard negative ratio')
     
     # Training Schedule
     parser.add_argument('--d_update_freq', type=int, default=10, help='Discriminator update frequency')
