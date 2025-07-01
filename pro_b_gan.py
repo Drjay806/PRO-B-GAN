@@ -18,21 +18,21 @@ Installation:
 Usage Examples:
 
     # Mode 1: Train from scratch
-    python prot_b_gan_clean.py --data_root /path/to/data --embedding_init rgcn
+    python prot_b_gan.py --data_root /path/to/data --embedding_init rgcn
 
     # Mode 2: Load pre-trained embeddings (like your original setup)
-    python prot_b_gan_clean.py --data_root /path/to/data --embedding_init rgcn \
+    python prot_b_gan.py --data_root /path/to/data --embedding_init rgcn \
         --load_embeddings \
         --node_emb_path /path/to/node_embeddings.pt \
         --rel_emb_path /path/to/rel_embeddings.pt \
         --rel_map_path /path/to/relation_map.pkl
 
     # Mode 3: Resume from checkpoint (if training failed)
-    python prot_b_gan_clean.py --data_root /path/to/data --embedding_init rgcn \
+    python prot_b_gan.py --data_root /path/to/data --embedding_init rgcn \
         --resume_checkpoint /path/to/checkpoint.pt
 
     # Your exact original configuration:
-    python prot_b_gan_clean.py \
+    python prot_b_gan.py \
         --data_root "/path/to/FB15k-237/converted" \
         --train_file "FB15k-237-train-graph_triplets.csv" \
         --val_file "FB15k-237-val-graph_triplets.csv" \
