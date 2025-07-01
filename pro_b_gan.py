@@ -2,7 +2,10 @@
 Prot-B-GAN: Clean Architecture for Knowledge Graph Completion
 ============================================================
 
-A logically consistent pipeline that only does what makes sense:
+A logically consistent pipeline with flexible training options:
+- Train from scratch (R-GCN, TransE, DistMult, ComplEx, Random)
+- Load pre-trained embeddings 
+- Resume from checkpoint
 - Smart warm-up logic (only when changing objectives)
 - Method-consistent scoring throughout
 - Progressive GAN-RL training
@@ -12,10 +15,35 @@ Installation:
     pip install torch==2.0.0 torchvision torchaudio
     pip install torch-geometric scikit-learn pandas matplotlib tqdm
 
-Usage:
+Usage Examples:
+
+    # Mode 1: Train from scratch
     python prot_b_gan_clean.py --data_root /path/to/data --embedding_init rgcn
-    python prot_b_gan_clean.py --data_root /path/to/data --embedding_init transe
-    python prot_b_gan_clean.py --data_root /path/to/data --embedding_init distmult
+
+    # Mode 2: Load pre-trained embeddings (like your original setup)
+    python prot_b_gan_clean.py --data_root /path/to/data --embedding_init rgcn \
+        --load_embeddings \
+        --node_emb_path /path/to/node_embeddings.pt \
+        --rel_emb_path /path/to/rel_embeddings.pt \
+        --rel_map_path /path/to/relation_map.pkl
+
+    # Mode 3: Resume from checkpoint (if training failed)
+    python prot_b_gan_clean.py --data_root /path/to/data --embedding_init rgcn \
+        --resume_checkpoint /path/to/checkpoint.pt
+
+    # Your exact original configuration:
+    python prot_b_gan_clean.py \
+        --data_root "/path/to/FB15k-237/converted" \
+        --train_file "FB15k-237-train-graph_triplets.csv" \
+        --val_file "FB15k-237-val-graph_triplets.csv" \
+        --test_file "FB15k-237-test-graph_triplets.csv" \
+        --load_embeddings \
+        --node_emb_path "/path/to/FB15k-237_final_node_embeddings.pt" \
+        --rel_emb_path "/path/to/FB15k-237_final_distmult_rel_emb.pt" \
+        --rel_map_path "/path/to/FB15k-237_relation_map.pkl" \
+        --embedding_init rgcn --embed_dim 500 --epochs 500 --batch_size 64 \
+        --pretrain_epochs 200 --rl_start_epoch 20 --full_system_epoch 25 \
+        --verbose
 """
 
 import os
@@ -40,8 +68,160 @@ from tqdm import tqdm
 from abc import ABC, abstractmethod
 
 # =============================================================================
-# SCORING FUNCTIONS - Each method uses its own scoring throughout
+# EMBEDDING LOADING AND CHECKPOINT UTILITIES
 # =============================================================================
+
+def load_pretrained_embeddings(args, num_entities, num_relations, device, verbose=True):
+    """Load pre-trained embeddings from files (like your original setup)"""
+    
+    if not all([args.node_emb_path, args.rel_emb_path]):
+        raise ValueError("Both --node_emb_path and --rel_emb_path must be provided when using --load_embeddings")
+    
+    print_progress(f" Loading pre-trained embeddings...", verbose)
+    print_progress(f"   Node embeddings: {args.node_emb_path}", verbose)
+    print_progress(f"   Relation embeddings: {args.rel_emb_path}", verbose)
+    
+    try:
+        # Load node embeddings
+        node_embeddings = torch.load(args.node_emb_path, map_location=device)
+        print_progress(f"  Loaded node embeddings: {node_embeddings.shape}", verbose)
+        
+        # Load relation embeddings
+        if args.rel_map_path:
+            # Load relation map and create embedding layer
+            with open(args.rel_map_path, "rb") as f:
+                relation_map = pickle.load(f)
+            rel_emb_layer = nn.Embedding(len(relation_map), args.embed_dim).to(device)
+            rel_emb_layer.load_state_dict(torch.load(args.rel_emb_path, map_location=device))
+            rel_embeddings = rel_emb_layer.weight.detach()
+            print_progress(f"  Loaded relation embeddings: {rel_embeddings.shape}", verbose)
+        else:
+            # Direct relation embedding file
+            rel_embeddings = torch.load(args.rel_emb_path, map_location=device)
+            print_progress(f"  Loaded relation embeddings: {rel_embeddings.shape}", verbose)
+        
+        # Verify dimensions
+        if node_embeddings.shape[0] != num_entities:
+            print_progress(f"   Warning: Node embedding count mismatch. Expected {num_entities}, got {node_embeddings.shape[0]}", verbose)
+        if rel_embeddings.shape[0] != num_relations:
+            print_progress(f"    Warning: Relation embedding count mismatch. Expected {num_relations}, got {rel_embeddings.shape[0]}", verbose)
+        if node_embeddings.shape[1] != args.embed_dim or rel_embeddings.shape[1] != args.embed_dim:
+            print_progress(f"   Warning: Embedding dimension mismatch. Expected {args.embed_dim}", verbose)
+        
+        print_progress(f" Pre-trained embeddings loaded successfully", verbose)
+        return node_embeddings, rel_embeddings
+        
+    except Exception as e:
+        print_progress(f" Failed to load pre-trained embeddings: {e}", verbose)
+        print_progress(f"   Falling back to training from scratch...", verbose)
+        return None, None
+
+def save_checkpoint(generator, discriminator, node_emb, rel_emb, g_opt, d_opt, epoch, 
+                   training_history, args, best_val_hit10, best_epoch, additional_data=None):
+    """Save training checkpoint with all necessary state"""
+    
+    checkpoint = {
+        # Model states
+        "generator": generator.state_dict(),
+        "discriminator": discriminator.state_dict(),
+        "node_emb": node_emb.detach().cpu(),
+        "rel_emb": rel_emb.state_dict(),
+        
+        # Optimizer states
+        "g_opt_state": g_opt.state_dict(),
+        "d_opt_state": d_opt.state_dict(),
+        
+        # Training state
+        "epoch": epoch,
+        "best_val_hit10": best_val_hit10,
+        "best_epoch": best_epoch,
+        
+        # Configuration
+        "args": vars(args),
+        "embed_dim": args.embed_dim,
+        "num_entities": node_emb.shape[0],
+        "num_relations": rel_emb.num_embeddings,
+        
+        # Training history
+        "training_history": training_history,
+        
+        # Additional data
+        "additional_data": additional_data or {}
+    }
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    checkpoint_path = os.path.join(args.output_dir, "checkpoint.pt")
+    torch.save(checkpoint, checkpoint_path)
+    
+    return checkpoint_path
+
+def load_checkpoint(checkpoint_path, generator, discriminator, node_emb, rel_emb, g_opt, d_opt, device, force_resume=False, verbose=True):
+    """Load training checkpoint and restore all state"""
+    
+    if not os.path.exists(checkpoint_path):
+        print_progress(f" Checkpoint not found: {checkpoint_path}", verbose)
+        return None
+    
+    try:
+        print_progress(f" Loading checkpoint: {checkpoint_path}", verbose)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        # Load model states
+        generator.load_state_dict(checkpoint["generator"])
+        discriminator.load_state_dict(checkpoint["discriminator"])
+        
+        # Load embeddings
+        saved_node_emb = checkpoint["node_emb"].to(device)
+        node_emb.data.copy_(saved_node_emb)
+        rel_emb.load_state_dict(checkpoint["rel_emb"])
+        
+        # Load optimizer states
+        if "g_opt_state" in checkpoint and "d_opt_state" in checkpoint:
+            g_opt.load_state_dict(checkpoint["g_opt_state"])
+            d_opt.load_state_dict(checkpoint["d_opt_state"])
+            
+            # Move optimizer states to device
+            for state in g_opt.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+            for state in d_opt.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+        
+        # Extract checkpoint info
+        resume_epoch = checkpoint.get("epoch", 0) + 1
+        best_val_hit10 = checkpoint.get("best_val_hit10", 0.0)
+        best_epoch = checkpoint.get("best_epoch", 0)
+        training_history = checkpoint.get("training_history", {})
+        
+        print_progress(f" Checkpoint loaded successfully", verbose)
+        print_progress(f"   Resuming from epoch {resume_epoch}", verbose)
+        print_progress(f"   Best validation Hit@10: {best_val_hit10:.4f} (epoch {best_epoch})", verbose)
+        
+        # Configuration check
+        if not force_resume and "args" in checkpoint:
+            saved_args = checkpoint["args"]
+            current_embed_dim = getattr(sys.modules[__name__], 'args', {}).get('embed_dim', None)
+            if current_embed_dim and saved_args.get("embed_dim") != current_embed_dim:
+                print_progress(f" Warning: Embed dim mismatch. Saved: {saved_args.get('embed_dim')}, Current: {current_embed_dim}", verbose)
+                print_progress(f"   Use --force_resume to continue anyway", verbose)
+        
+        return {
+            "resume_epoch": resume_epoch,
+            "best_val_hit10": best_val_hit10,
+            "best_epoch": best_epoch,
+            "training_history": training_history
+        }
+        
+    except Exception as e:
+        print_progress(f"❌ Failed to load checkpoint: {e}", verbose)
+        if not force_resume:
+            print_progress(f"   Use --force_resume to attempt loading anyway", verbose)
+            return None
+        print_progress(f"   Force resume enabled, continuing...", verbose)
+        return {"resume_epoch": 1, "best_val_hit10": 0.0, "best_epoch": 0, "training_history": {}}
 
 def get_scoring_function(method):
     """Return method-specific scoring function - no cross-method conversions!"""
@@ -75,7 +255,7 @@ def get_scoring_function(method):
         'distmult': distmult_score,
         'complex': complex_score,
         'rgcn': rgcn_score,
-        'random': distmult_score  # Default for random init
+        'random': distmult_score  
     }
     
     if method.lower() not in scoring_functions:
@@ -92,9 +272,9 @@ def needs_warmup(embedding_method):
     warmup_needed = {
         'rgcn': True,     # R-GCN → DistMult (structure → multiplicative)
         'random': True,   # Random → Method (no training → trained)
-        'transe': False,  
-        'distmult': False, 
-        'complex': False  
+        'transe': False,  # TransE 
+        'distmult': False, # DistMult 
+        'complex': False  # ComplEx 
     }
     return warmup_needed.get(embedding_method.lower(), False)
 
@@ -102,19 +282,19 @@ def smart_warmup(node_emb, rel_emb, train_loader, device, method, epochs=50, lr=
     """Smart warm-up: only train when changing objectives"""
     
     if not needs_warmup(method):
-        print_progress(f"⚡ Skipping warm-up for {method} (already trained with same objective)", verbose)
+        print_progress(f" Skipping warm-up for {method} (already trained with same objective)", verbose)
         return
     
     if method.lower() == 'rgcn':
         # R-GCN → DistMult alignment
-        print_progress(f"🔥 R-GCN → DistMult alignment warm-up ({epochs} epochs)...", verbose)
+        print_progress(f" R-GCN → DistMult alignment warm-up ({epochs} epochs)...", verbose)
         target_score_fn = get_scoring_function('distmult')
     elif method.lower() == 'random':
         # Random → DistMult training (could be any method, defaulting to DistMult)
-        print_progress(f"🔥 Random → DistMult training ({epochs} epochs)...", verbose)
+        print_progress(f" Random → DistMult training ({epochs} epochs)...", verbose)
         target_score_fn = get_scoring_function('distmult')
     else:
-        return  # Should not reach here due to needs_warmup check
+        return  
     
     optimizer = optim.Adam([node_emb, rel_emb.weight], lr=lr)
     start_time = time.time()
@@ -870,22 +1050,32 @@ def train_prot_b_gan_clean(args):
         print_progress(f"Using {args.embedding_init} scoring function throughout", args.verbose)
         
         # =========================================================================
-        # STAGE 2: Smart Warm-up (Only When Needed)
+        # STAGE 2: Smart Warm-up (Skip if loading pre-trained or resuming)
         # =========================================================================
         
-        print_progress(f"\n STAGE 2: Smart Warm-up Analysis", args.verbose)
-        
-        if needs_warmup(args.embedding_init):
-            print_progress(f" Warm-up needed for {args.embedding_init}", args.verbose)
-            smart_warmup(node_emb, rel_emb, train_loader, device, args.embedding_init, 
-                        epochs=args.warmup_epochs, lr=args.warmup_lr, verbose=args.verbose)
+        if not args.load_embeddings and not args.resume_checkpoint:
+            print_progress(f"\n STAGE 2: Smart Warm-up Analysis", args.verbose)
+            
+            if needs_warmup(args.embedding_init):
+                print_progress(f" Warm-up needed for {args.embedding_init}", args.verbose)
+                smart_warmup(node_emb, rel_emb, train_loader, device, args.embedding_init, 
+                            epochs=args.warmup_epochs, lr=args.warmup_lr, verbose=args.verbose)
+            else:
+                print_progress(f" Warm-up skipped for {args.embedding_init} (same objective already trained)", args.verbose)
+            
+            # Evaluate baseline performance
+            print_progress("Evaluating baseline performance...", args.verbose)
+            baseline_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k, score_function)
+            print_progress(f"Baseline Hit@10: {baseline_hit_at_k[10]:.4f}", args.verbose)
         else:
-            print_progress(f" Warm-up skipped for {args.embedding_init} (same objective already trained)", args.verbose)
-        
-        # Evaluate baseline performance
-        print_progress("Evaluating baseline performance...", args.verbose)
-        baseline_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k, score_function)
-        print_progress(f"Baseline Hit@10: {baseline_hit_at_k[10]:.4f}", args.verbose)
+            if args.load_embeddings:
+                print_progress(f"\n STAGE 2: Warm-up skipped (using pre-trained embeddings)", args.verbose)
+            else:
+                print_progress(f"\n STAGE 2: Warm-up skipped (resuming from checkpoint)", args.verbose)
+            
+            # Quick baseline evaluation for reference
+            baseline_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k, score_function)
+            print_progress(f"Current embedding Hit@10: {baseline_hit_at_k[10]:.4f}", args.verbose)
         
         # =========================================================================
         # STAGE 3: GAN-RL Training
@@ -917,7 +1107,7 @@ def train_prot_b_gan_clean(args):
         
         print_progress("Starting three-tier progressive training...", args.verbose)
         
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             
             # =================================================================
             # TIER 1: Generator Pretraining
@@ -1029,9 +1219,26 @@ def train_prot_b_gan_clean(args):
                 loss_components = []
                 
                 # Method-specific RL reward
-                method_scores = score_function(h_emb, r_emb_batch, fake)
-                rl_loss = -torch.tanh(method_scores / 5.0).mean()
-                loss_components.append(args.rl_weight * rl_loss)
+                rl_loss, rl_metrics = compute_composite_rl_loss(
+                    tier2_epoch_count, tier3_epoch_count, current_tier,
+                    h_emb, r_emb_batch, fake, t_emb, discriminator,
+                    args.rl_start_epoch, args.full_system_epoch, score_function
+                )
+                if rl_loss.item() != 0:
+                    loss_components.append(args.rl_weight * rl_loss)
+                
+                # Refinement loss (your sophisticated approach)
+                refinement_loss = F.mse_loss(fake, t_emb)
+                loss_components.append(args.refinement_weight * refinement_loss)
+                
+                # DistMult component loss
+                distmult_scores = score_function(h_emb, r_emb_batch, fake)
+                distmult_loss = -torch.tanh(distmult_scores / 10.0).mean()
+                loss_components.append(args.distmult_weight * distmult_loss)
+                
+                # Bias mitigation (your approach)
+                bias_loss = compute_bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb_batch)
+                loss_components.append(args.bias_weight * bias_loss)
                 
                 # Adversarial loss (Tier 3 only)
                 if current_tier == 3:
@@ -1047,11 +1254,13 @@ def train_prot_b_gan_clean(args):
                 neg_cos = F.cosine_similarity(fake.unsqueeze(1), neg_t_embs, dim=-1)
                 cos_margin = F.relu(0.3 + neg_cos - pos_cos.unsqueeze(1)).mean()
                 
-                # L2 regularization
+                # L2 regularization and diversity losses (your approach)
                 l2_loss = (fake - t_emb.detach()).pow(2).mean()
+                fake_std = fake.std(dim=0).mean()
+                diversity_loss = 0.2 * torch.exp(-5 * fake_std)
                 
-                # Final generator loss
-                final_loss = sum(loss_components) + args.g_guidance_weight * cos_margin + args.l2_reg_weight * l2_loss
+                # Final generator loss (your exact composition)
+                final_loss = sum(loss_components) + args.g_guidance_weight * cos_margin + args.l2_reg_weight * l2_loss + diversity_loss
                 final_loss.backward()
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), args.clip_norm)
                 g_opt.step()
@@ -1146,7 +1355,7 @@ def train_prot_b_gan_clean(args):
         checkpoint_path = os.path.join(args.output_dir, f"checkpoint_{args.embedding_init}.pt")
         torch.save(checkpoint, checkpoint_path)
         
-        print(f"\n💾 Results saved to: {args.output_dir}")
+        print(f"\n Results saved to: {args.output_dir}")
         print(f"   - {results_path}")
         print(f"   - {checkpoint_path}")
         
@@ -1172,6 +1381,16 @@ def main():
     parser.add_argument('--val_file', type=str, default='val.csv', help='Validation data file')
     parser.add_argument('--test_file', type=str, default='test.csv', help='Test data file')
     parser.add_argument('--output_dir', type=str, default='./clean_results', help='Output directory')
+    
+    # Pre-trained embeddings (optional)
+    parser.add_argument('--load_embeddings', action='store_true', help='Load pre-trained embeddings instead of training from scratch')
+    parser.add_argument('--node_emb_path', type=str, help='Path to pre-trained node embeddings (.pt file)')
+    parser.add_argument('--rel_emb_path', type=str, help='Path to pre-trained relation embeddings (.pt file)')
+    parser.add_argument('--rel_map_path', type=str, help='Path to relation mapping (.pkl file)')
+    
+    # Checkpoint resuming (optional)
+    parser.add_argument('--resume_checkpoint', type=str, help='Path to checkpoint file to resume training from')
+    parser.add_argument('--force_resume', action='store_true', help='Force resume even if epoch/config mismatch')
     
     # Model Architecture
     parser.add_argument('--embed_dim', type=int, default=128, help='Embedding dimension')
@@ -1217,9 +1436,12 @@ def main():
     parser.add_argument('--d_update_freq', type=int, default=5, help='Discriminator update frequency')
     
     # Loss weights
-    parser.add_argument('--rl_weight', type=float, default=1.0, help='RL loss weight')
-    parser.add_argument('--adv_weight', type=float, default=0.5, help='Adversarial loss weight')
-    parser.add_argument('--g_guidance_weight', type=float, default=2.0, help='Generator guidance weight')
+    parser.add_argument('--rl_weight', type=float, default=0.1, help='RL loss weight')
+    parser.add_argument('--adv_weight', type=float, default=0.05, help='Adversarial loss weight')
+    parser.add_argument('--refinement_weight', type=float, default=0.7, help='Refinement loss weight')
+    parser.add_argument('--distmult_weight', type=float, default=0.2, help='DistMult loss weight')
+    parser.add_argument('--bias_weight', type=float, default=0.1, help='Bias mitigation weight')
+    parser.add_argument('--g_guidance_weight', type=float, default=1.0, help='Generator guidance weight')
     parser.add_argument('--l2_reg_weight', type=float, default=0.1, help='L2 regularization weight')
     
     # Evaluation
@@ -1252,14 +1474,17 @@ def main():
     results = train_prot_b_gan_clean(args)
     
     if results:
-        print(f"\n SUCCESS! {args.embedding_init.upper()} + GAN-RL completed")
+        training_mode = "RESUMED" if args.resume_checkpoint else ("PRE-TRAINED" if args.load_embeddings else "FROM SCRATCH")
+        print(f"\n SUCCESS! {args.embedding_init.upper()} + GAN-RL completed ({training_mode})")
+        print(f"Training mode: {results['training_summary'].get('training_mode', 'unknown').upper()}")
+        print(f"Epochs: {results['training_summary']['start_epoch']} → {results['training_summary']['total_epochs_trained']}")
         print(f"Baseline → Final improvement:")
         for k in args.hit_at_k:
             improvement = results['improvement'][k]
             print(f"  Hit@{k}: +{improvement:.4f} ({improvement*100:+.1f}%)")
         return 0
     else:
-        print(f" Training failed")
+        print(f"❌ Training failed")
         return 1
 
 if __name__ == "__main__":
