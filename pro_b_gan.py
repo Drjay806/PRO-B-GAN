@@ -41,7 +41,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, average_precision_score, matthews_corrcoef, roc_auc_score, precision_score, recall_score
 from sklearn.decomposition import PCA
 import numpy as np
-from collections import deque
+from collections import deque, defaultdict
 import time
 import random
 from tqdm import tqdm
@@ -214,13 +214,14 @@ class EmbeddingInitializer(ABC):
         pass
 
 # =============================================================================
-#  RGCN IMPLEMENTATION (PAPER-ALIGNED)
+# EXACT RGCN + DISTMULT IMPLEMENTATION (FROM YOUR STANDALONE CODE)
 # =============================================================================
 
 class RGCNDistMult(nn.Module):
     """
     R-GCN + DistMult as described in Schlichtkrull et al. 2017
     "Modeling Relational Data with Graph Convolutional Networks"
+    EXACT COPY FROM YOUR STANDALONE CODE
     """
     def __init__(self, num_entities, num_relations, hidden_dim=500, num_bases=None, num_layers=2):
         super().__init__()
@@ -235,6 +236,14 @@ class RGCNDistMult(nn.Module):
         # Set num_bases as in paper (typically num_relations // 2 for FB15k-237)
         if num_bases is None:
             num_bases = min(num_relations, max(25, num_relations // 4))
+
+        if TORCH_GEOMETRIC_AVAILABLE:
+            print(f"R-GCN Configuration:")
+            print(f"  Entities: {num_entities:,}")
+            print(f"  Relations: {num_relations:,}")
+            print(f"  Hidden dim: {hidden_dim}")
+            print(f"  Num bases: {num_bases}")
+            print(f"  Layers: {num_layers}")
 
         # Entity embeddings (input to R-GCN)
         self.entity_embedding = nn.Embedding(num_entities, hidden_dim)
@@ -260,6 +269,7 @@ class RGCNDistMult(nn.Module):
     def apply_edge_dropout(self, edge_index, edge_type, dropout_rate_self=0.2, dropout_rate_other=0.4):
         """
         Apply edge dropout as in paper: 0.2 for self-loops, 0.4 for others
+        EXACT COPY FROM YOUR STANDALONE CODE
         """
         if not self.training:
             return edge_index, edge_type
@@ -282,7 +292,10 @@ class RGCNDistMult(nn.Module):
         return edge_index[:, mask], edge_type[mask]
 
     def forward_entities(self, edge_index, edge_type):
-        """Forward pass through R-GCN to get entity representations"""
+        """
+        Forward pass through R-GCN to get entity representations
+        EXACT COPY FROM YOUR STANDALONE CODE
+        """
         # Apply edge dropout before message passing
         edge_index_dropped, edge_type_dropped = self.apply_edge_dropout(edge_index, edge_type)
 
@@ -298,21 +311,31 @@ class RGCNDistMult(nn.Module):
         return x
 
     def distmult_score(self, head_emb, rel_emb, tail_emb):
-        """DistMult scoring function: <h, r, t> = Σ(h ⊙ r ⊙ t)"""
+        """
+        DistMult scoring function: <h, r, t> = Σ(h ⊙ r ⊙ t)
+        EXACT COPY FROM YOUR STANDALONE CODE
+        """
         return torch.sum(head_emb * rel_emb * tail_emb, dim=-1)
 
-class RGCNInitializer(EmbeddingInitializer):
-    def __init__(self, embed_dim=128, epochs=100, lr=0.01, layers=2, l2_penalty=0.01):
-        self.embed_dim = embed_dim
-        self.epochs = epochs
-        self.lr = lr
-        self.layers = layers
+class RGCNTrainer:
+    """
+    Trainer following the exact paper methodology
+    EXACT COPY FROM YOUR STANDALONE CODE
+    """
+
+    def __init__(self, model, device='cuda', lr=0.01, l2_penalty=0.01):
+        self.model = model.to(device)
+        self.device = device
         self.l2_penalty = l2_penalty
-    
+
+        # Optimizer as in paper
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
     def negative_sampling_paper(self, positive_triples, num_entities):
         """
         Paper negative sampling: ω = 1 (one negative per positive)
         Corrupt either head or tail randomly
+        EXACT COPY FROM YOUR STANDALONE CODE
         """
         batch_size = positive_triples.shape[0]
         negative_triples = positive_triples.clone()
@@ -327,84 +350,225 @@ class RGCNInitializer(EmbeddingInitializer):
                 negative_triples[i, 2] = random.randint(0, num_entities - 1)
 
         return negative_triples
+
+    def train_epoch_fullbatch(self, edge_index, edge_type, train_triples):
+        """
+        Full-batch training as in paper (not mini-batch!)
+        EXACT COPY FROM YOUR STANDALONE CODE
+        """
+        self.model.train()
+
+        # Get entity embeddings from R-GCN
+        entity_embeddings = self.model.forward_entities(edge_index, edge_type)
+
+        # Positive triples
+        pos_heads = entity_embeddings[train_triples[:, 0]]
+        pos_rels = self.model.relation_embedding(train_triples[:, 1])
+        pos_tails = entity_embeddings[train_triples[:, 2]]
+        positive_scores = self.model.distmult_score(pos_heads, pos_rels, pos_tails)
+
+        # Generate negatives (ω = 1)
+        negative_triples = self.negative_sampling_paper(train_triples, self.model.num_entities)
+
+        neg_heads = entity_embeddings[negative_triples[:, 0]]
+        neg_rels = self.model.relation_embedding(negative_triples[:, 1])
+        neg_tails = entity_embeddings[negative_triples[:, 2]]
+        negative_scores = self.model.distmult_score(neg_heads, neg_rels, neg_tails)
+
+        # Margin ranking loss (paper default)
+        margin = 1.0
+        ranking_loss = F.relu(margin + negative_scores - positive_scores).mean()
+
+        # L2 regularization on decoder (relation embeddings) - paper: 0.01
+        l2_loss = self.l2_penalty * self.model.relation_embedding.weight.norm(2).pow(2)
+
+        total_loss = ranking_loss + l2_loss
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+
+        # Gradient clipping (standard practice)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+        self.optimizer.step()
+
+        return total_loss.item(), ranking_loss.item(), l2_loss.item()
+
+    def evaluate_hit_at_k_simple(self, edge_index, edge_type, eval_triples, k_values=[1, 5, 10]):
+        """
+        Simplified Hit@K evaluation for embedding initialization (faster than full filtered eval)
+        """
+        self.model.eval()
+        hits = {k: 0 for k in k_values}
+        total = 0
+
+        with torch.no_grad():
+            # Get all entity embeddings
+            entity_embeddings = self.model.forward_entities(edge_index, edge_type)
+
+            # Sample a subset for faster evaluation during initialization
+            max_eval_samples = min(1000, len(eval_triples))
+            eval_indices = torch.randperm(len(eval_triples))[:max_eval_samples]
+            sample_triples = eval_triples[eval_indices]
+
+            for triple in sample_triples:
+                head, rel, tail = triple.cpu().numpy()
+
+                # Get embeddings
+                head_emb = entity_embeddings[head:head+1]
+                rel_emb = self.model.relation_embedding(torch.tensor([rel], device=self.device))
+
+                # Score against all possible tails
+                all_scores = self.model.distmult_score(
+                    head_emb.expand(self.model.num_entities, -1),
+                    rel_emb.expand(self.model.num_entities, -1),
+                    entity_embeddings
+                )
+
+                # Calculate rank (no filtering for speed)
+                target_score = all_scores[tail].item()
+                rank = (all_scores > target_score).sum().item() + 1
+
+                # Update metrics
+                for k in k_values:
+                    if rank <= k:
+                        hits[k] += 1
+
+                total += 1
+
+        # Calculate final metrics
+        hit_ratios = {k: hits[k] / total for k in k_values}
+        self.model.train()
+        return hit_ratios
+
+class RGCNInitializer(EmbeddingInitializer):
+    def __init__(self, embed_dim=128, epochs=100, lr=0.01, layers=2, l2_penalty=0.01, early_stopping_patience=15):
+        self.embed_dim = embed_dim
+        self.epochs = epochs
+        self.lr = lr
+        self.layers = layers
+        self.l2_penalty = l2_penalty
+        self.early_stopping_patience = early_stopping_patience
     
     def initialize_embeddings(self, train_df, val_df, test_df, num_entities, num_relations, device, verbose=True):
         if not TORCH_GEOMETRIC_AVAILABLE:
             raise ImportError("torch_geometric is required for R-GCN initialization. Install with: pip install torch-geometric")
         
         if verbose:
-            print(f"Training R-GCN embeddings (Paper implementation, {self.epochs} epochs)...")
-            print(f"  Entities: {num_entities:,}")
-            print(f"  Relations: {num_relations:,}")
-            print(f"  Hidden dim: {self.embed_dim}")
-            print(f"  Layers: {self.layers}")
+            print(f"Training R-GCN + DistMult embeddings (YOUR EXACT METHODOLOGY)")
+            print(f"  Epochs: {self.epochs} (with early stopping patience: {self.early_stopping_patience})")
+            print(f"  Training method: Full-batch (paper-exact)")
+            print(f"  Edge dropout: 0.2 self-loops, 0.4 others")
+            print(f"  L2 penalty: {self.l2_penalty} on decoder")
+            print(f"  Learning rate: {self.lr}")
         
-        # Build graph from all data
+        # Build graph from all data (YOUR EXACT METHOD)
         all_data = pd.concat([train_df, val_df, test_df])
         all_triples = torch.tensor(all_data.values, dtype=torch.long)
         edge_index = all_triples[:, [0, 2]].t().contiguous().to(device)
         edge_type = all_triples[:, 1].to(device)
         
-        # Initialize R-GCN model
-        num_bases = min(num_relations, max(25, num_relations // 4))
-        rgcn_model = RGCNDistMult(num_entities, num_relations, self.embed_dim, num_bases, self.layers).to(device)
-        optimizer = optim.Adam(rgcn_model.parameters(), lr=self.lr)
-        
+        # Initialize YOUR EXACT R-GCN model
+        model = RGCNDistMult(
+            num_entities=num_entities,
+            num_relations=num_relations,
+            hidden_dim=self.embed_dim,
+            num_bases=None,  # Will be set automatically like in your code
+            num_layers=self.layers
+        )
+
+        trainer = RGCNTrainer(
+            model,
+            device=device,
+            lr=self.lr,
+            l2_penalty=self.l2_penalty
+        )
+
+        # Convert data to tensors
         train_triples = torch.tensor(train_df.values, dtype=torch.long).to(device)
-        
+        val_triples = torch.tensor(val_df.values, dtype=torch.long).to(device)
+
+        # Training with YOUR EXACT methodology + early stopping
+        best_val_hit10 = 0.0
+        patience_counter = 0
+        training_history = []
+
         if verbose:
-            print(f"  Configuration: lr={self.lr}, l2_penalty={self.l2_penalty}, num_bases={num_bases}")
-        
-        # Training loop following paper methodology
+            print(f"\nStarting R-GCN training (YOUR EXACT METHOD)...")
+            print("="*60)
+
         for epoch in range(self.epochs):
-            rgcn_model.train()
-            
-            # Get entity embeddings from R-GCN
-            entity_embeddings = rgcn_model.forward_entities(edge_index, edge_type)
-            
-            # Full batch training as in paper
-            pos_heads = entity_embeddings[train_triples[:, 0]]
-            pos_rels = rgcn_model.relation_embedding(train_triples[:, 1])
-            pos_tails = entity_embeddings[train_triples[:, 2]]
-            positive_scores = rgcn_model.distmult_score(pos_heads, pos_rels, pos_tails)
-            
-            # Generate negatives (ω = 1)
-            negative_triples = self.negative_sampling_paper(train_triples, num_entities)
-            neg_heads = entity_embeddings[negative_triples[:, 0]]
-            neg_rels = rgcn_model.relation_embedding(negative_triples[:, 1])
-            neg_tails = entity_embeddings[negative_triples[:, 2]]
-            negative_scores = rgcn_model.distmult_score(neg_heads, neg_rels, neg_tails)
-            
-            # Margin ranking loss (paper default)
-            margin = 1.0
-            ranking_loss = F.relu(margin + negative_scores - positive_scores).mean()
-            
-            # L2 regularization on decoder (relation embeddings) - paper: 0.01
-            l2_loss = self.l2_penalty * rgcn_model.relation_embedding.weight.norm(2).pow(2)
-            
-            total_loss = ranking_loss + l2_loss
-            
-            optimizer.zero_grad()
-            total_loss.backward()
-            
-            # Gradient clipping (standard practice)
-            torch.nn.utils.clip_grad_norm_(rgcn_model.parameters(), 1.0)
-            
-            optimizer.step()
-            
-            if verbose and epoch % 20 == 0:
-                print(f"  R-GCN Epoch {epoch}: Total Loss = {total_loss.item():.4f} (Ranking: {ranking_loss.item():.4f}, L2: {l2_loss.item():.6f})")
-        
-        with torch.no_grad():
-            final_node_embeddings = rgcn_model.forward_entities(edge_index, edge_type)
-            final_rel_embeddings = rgcn_model.relation_embedding.weight
-        
+            # YOUR EXACT training method
+            epoch_start = time.time()
+            total_loss, ranking_loss, l2_loss = trainer.train_epoch_fullbatch(
+                edge_index, edge_type, train_triples
+            )
+            epoch_time = time.time() - epoch_start
+
+            # Save training info
+            training_history.append({
+                'epoch': epoch,
+                'total_loss': total_loss,
+                'ranking_loss': ranking_loss,
+                'l2_loss': l2_loss,
+                'epoch_time': epoch_time
+            })
+
+            # Evaluation for early stopping (every 10 epochs or at key points)
+            if epoch % 10 == 0 or epoch == self.epochs - 1:
+                if verbose:
+                    print(f"Epoch {epoch}: Loss = {total_loss:.4f} (Ranking: {ranking_loss:.4f}, L2: {l2_loss:.6f}) - {epoch_time:.1f}s")
+
+                # Quick evaluation for early stopping
+                val_hits = trainer.evaluate_hit_at_k_simple(edge_index, edge_type, val_triples)
+                
+                if verbose:
+                    print(f"  Validation: Hit@1: {val_hits[1]:.3f}, Hit@5: {val_hits[5]:.3f}, Hit@10: {val_hits[10]:.3f}")
+
+                # Check for improvement
+                if val_hits[10] > best_val_hit10:
+                    best_val_hit10 = val_hits[10]
+                    patience_counter = 0
+                    
+                    # Save best embeddings
+                    with torch.no_grad():
+                        best_node_embeddings = model.forward_entities(edge_index, edge_type).detach().clone()
+                        best_rel_embeddings = model.relation_embedding.weight.detach().clone()
+                    
+                    if verbose:
+                        print(f"  ✅ New best: Hit@10 {best_val_hit10:.3f}")
+                else:
+                    patience_counter += 1
+                    if verbose:
+                        print(f"  No improvement. Patience: {patience_counter}/{self.early_stopping_patience}")
+
+                if patience_counter >= self.early_stopping_patience:
+                    if verbose:
+                        print(f"\n🛑 Early stopping triggered after {self.early_stopping_patience} epochs without improvement")
+                        print(f"Best validation Hit@10: {best_val_hit10:.3f}")
+                    break
+
+            elif epoch % 5 == 0:
+                if verbose:
+                    print(f"Epoch {epoch}: Loss = {total_loss:.4f} - {epoch_time:.1f}s")
+
+        # Use best embeddings or final if no early stopping occurred
+        try:
+            final_node_embeddings = best_node_embeddings
+            final_rel_embeddings = best_rel_embeddings
+        except:
+            with torch.no_grad():
+                final_node_embeddings = model.forward_entities(edge_index, edge_type)
+                final_rel_embeddings = model.relation_embedding.weight
+
         if verbose:
-            print("R-GCN training complete")
+            print(f"R-GCN + DistMult training complete (YOUR EXACT METHOD)")
+            print(f"Final embeddings: {final_node_embeddings.shape} nodes, {final_rel_embeddings.shape} relations")
+
         return final_node_embeddings, final_rel_embeddings
     
     def get_name(self):
-        return "R-GCN (Paper)"
+        return "R-GCN + DistMult (Paper-Exact)"
 
 class RandomInitializer(EmbeddingInitializer):
     def __init__(self, embed_dim=128):
@@ -649,7 +813,7 @@ def create_embedding_initializer(args):
     if method == 'rgcn':
         if not TORCH_GEOMETRIC_AVAILABLE:
             raise ImportError("torch_geometric is required for R-GCN initialization. Install with: pip install torch-geometric")
-        return RGCNInitializer(args.embed_dim, args.rgcn_epochs, args.rgcn_lr, args.rgcn_layers, args.rgcn_l2_penalty)
+        return RGCNInitializer(args.embed_dim, args.rgcn_epochs, args.rgcn_lr, args.rgcn_layers, args.rgcn_l2_penalty, args.rgcn_early_stopping_patience)
     elif method == 'random':
         return RandomInitializer(args.embed_dim)
     elif method == 'transe':
@@ -1496,6 +1660,7 @@ def main():
     parser.add_argument('--rgcn_lr', type=float, default=0.01, help='R-GCN learning rate')
     parser.add_argument('--rgcn_layers', type=int, default=2, help='R-GCN layers')
     parser.add_argument('--rgcn_l2_penalty', type=float, default=0.01, help='R-GCN L2 penalty')
+    parser.add_argument('--rgcn_early_stopping_patience', type=int, default=15, help='R-GCN early stopping patience')
 
     # TransE specific parameters
     parser.add_argument('--transe_epochs', type=int, default=100, help='TransE training epochs')
@@ -1537,7 +1702,7 @@ def main():
     parser.add_argument('--hit_at_k', type=int, nargs='+', default=[1, 5, 10], help='Hit@K values')
     parser.add_argument('--early_stopping_patience', type=int, default=30, help='Early stopping patience')
     
-    # Display and debug options
+    # Display and debug options (UPDATED)
     parser.add_argument('--display_mode', type=str, default='detailed', choices=['simple', 'detailed'],
                         help='Display mode: simple (one-line) or detailed (multi-line)')
     parser.add_argument('--detailed_metrics', action='store_true', default=True, 
@@ -1553,8 +1718,8 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"MODULAR PROT-B-GAN with TIERED SYSTEM (UPDATED)")
-    print(f"  Embedding Init: {args.embedding_init.upper()}")
+    print(f"MODULAR PROT-B-GAN with EXACT R-GCN + DISTMULT (UPDATED)")
+    print(f"  Embedding Init: {args.embedding_init.upper()} (Paper-Exact Methodology)")
     print(f"  Reward Method: {args.reward_scoring_method.upper()}")
     print(f"  Display Mode: {args.display_mode}")
     print(f"  Detailed Metrics: {args.detailed_metrics}")
