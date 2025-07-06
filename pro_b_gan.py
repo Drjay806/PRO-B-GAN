@@ -1340,7 +1340,7 @@ def main():
     # Embedding initialization
     parser.add_argument('--embedding_init', type=str, default='rgcn', 
                      choices=['rgcn', 'random', 'transe', 'distmult', 'complex'], 
-                     help='Embedding initialization method'
+                     help='Embedding initialization method')
     parser.add_argument('--reward_scoring_method', type=str, default='distmult',
                         choices=['distmult', 'transe', 'auto'],
                         help='Reward scoring method')
