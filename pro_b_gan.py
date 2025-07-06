@@ -193,7 +193,192 @@ class Discriminator(nn.Module):
             return scores.cpu().numpy(), probabilities.cpu().numpy()
 
 # =============================================================================
-# EMBEDDING INITIALIZATION METHODS (FROM MODULAR EXAMPLE)
+# UPDATED RGCN IMPLEMENTATION (PAPER-ALIGNED)
+# =============================================================================
+
+class RGCNDistMult(nn.Module):
+    """
+    R-GCN + DistMult as described in Schlichtkrull et al. 2017
+    "Modeling Relational Data with Graph Convolutional Networks"
+    """
+    def __init__(self, num_entities, num_relations, hidden_dim=500, num_bases=None, num_layers=2):
+        super().__init__()
+
+        self.num_entities = num_entities
+        self.num_relations = num_relations
+        self.hidden_dim = hidden_dim
+
+        # Set num_bases as in paper (typically num_relations // 2 for FB15k-237)
+        if num_bases is None:
+            num_bases = min(num_relations, max(25, num_relations // 4))
+
+        # Entity embeddings (input to R-GCN)
+        self.entity_embedding = nn.Embedding(num_entities, hidden_dim)
+
+        # R-GCN layers
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            self.layers.append(
+                RGCNConv(hidden_dim, hidden_dim, num_relations, num_bases=num_bases)
+            )
+
+        # DistMult relation embeddings (separate from R-GCN relations)
+        self.relation_embedding = nn.Embedding(num_relations, hidden_dim)
+
+        # Initialize as in paper
+        nn.init.xavier_uniform_(self.entity_embedding.weight)
+        nn.init.xavier_uniform_(self.relation_embedding.weight)
+
+        self.dropout = nn.Dropout(0.2)
+
+    def apply_edge_dropout(self, edge_index, edge_type, dropout_rate_self=0.2, dropout_rate_other=0.4):
+        """
+        Apply edge dropout as in paper: 0.2 for self-loops, 0.4 for others
+        """
+        if not self.training:
+            return edge_index, edge_type
+
+        num_edges = edge_index.shape[1]
+        mask = torch.ones(num_edges, dtype=torch.bool, device=edge_index.device)
+
+        # Identify self-loops
+        self_loops = edge_index[0] == edge_index[1]
+
+        # Apply different dropout rates
+        for i in range(num_edges):
+            if self_loops[i]:
+                if random.random() < dropout_rate_self:
+                    mask[i] = False
+            else:
+                if random.random() < dropout_rate_other:
+                    mask[i] = False
+
+        return edge_index[:, mask], edge_type[mask]
+
+    def forward_entities(self, edge_index, edge_type):
+        """Forward pass through R-GCN to get entity representations"""
+        # Apply edge dropout before message passing
+        edge_index_dropped, edge_type_dropped = self.apply_edge_dropout(edge_index, edge_type)
+
+        # Get initial entity embeddings
+        x = self.entity_embedding.weight  # [num_entities, hidden_dim]
+
+        # Apply R-GCN layers
+        for layer in self.layers:
+            x = layer(x, edge_index_dropped, edge_type_dropped)
+            x = F.relu(x)
+            x = self.dropout(x)
+
+        return x
+
+    def distmult_score(self, head_emb, rel_emb, tail_emb):
+        """DistMult scoring function: <h, r, t> = Σ(h ⊙ r ⊙ t)"""
+        return torch.sum(head_emb * rel_emb * tail_emb, dim=-1)
+
+class RGCNInitializer(EmbeddingInitializer):
+    def __init__(self, embed_dim=128, epochs=100, lr=0.01, layers=2, l2_penalty=0.01):
+        self.embed_dim = embed_dim
+        self.epochs = epochs
+        self.lr = lr
+        self.layers = layers
+        self.l2_penalty = l2_penalty
+    
+    def negative_sampling_paper(self, positive_triples, num_entities):
+        """
+        Paper negative sampling: ω = 1 (one negative per positive)
+        Corrupt either head or tail randomly
+        """
+        batch_size = positive_triples.shape[0]
+        negative_triples = positive_triples.clone()
+
+        # Random corruption (head or tail)
+        for i in range(batch_size):
+            if random.random() < 0.5:
+                # Corrupt head
+                negative_triples[i, 0] = random.randint(0, num_entities - 1)
+            else:
+                # Corrupt tail
+                negative_triples[i, 2] = random.randint(0, num_entities - 1)
+
+        return negative_triples
+    
+    def initialize_embeddings(self, train_df, val_df, test_df, num_entities, num_relations, device, verbose=True):
+        if verbose:
+            print(f"Training R-GCN embeddings (Paper implementation, {self.epochs} epochs)...")
+            print(f"  Entities: {num_entities:,}")
+            print(f"  Relations: {num_relations:,}")
+            print(f"  Hidden dim: {self.embed_dim}")
+            print(f"  Layers: {self.layers}")
+        
+        # Build graph from all data
+        all_data = pd.concat([train_df, val_df, test_df])
+        all_triples = torch.tensor(all_data.values, dtype=torch.long)
+        edge_index = all_triples[:, [0, 2]].t().contiguous().to(device)
+        edge_type = all_triples[:, 1].to(device)
+        
+        # Initialize R-GCN model
+        num_bases = min(num_relations, max(25, num_relations // 4))
+        rgcn_model = RGCNDistMult(num_entities, num_relations, self.embed_dim, num_bases, self.layers).to(device)
+        optimizer = optim.Adam(rgcn_model.parameters(), lr=self.lr)
+        
+        train_triples = torch.tensor(train_df.values, dtype=torch.long).to(device)
+        
+        if verbose:
+            print(f"  Configuration: lr={self.lr}, l2_penalty={self.l2_penalty}, num_bases={num_bases}")
+        
+        # Training loop following paper methodology
+        for epoch in range(self.epochs):
+            rgcn_model.train()
+            
+            # Get entity embeddings from R-GCN
+            entity_embeddings = rgcn_model.forward_entities(edge_index, edge_type)
+            
+            # Full batch training as in paper
+            pos_heads = entity_embeddings[train_triples[:, 0]]
+            pos_rels = rgcn_model.relation_embedding(train_triples[:, 1])
+            pos_tails = entity_embeddings[train_triples[:, 2]]
+            positive_scores = rgcn_model.distmult_score(pos_heads, pos_rels, pos_tails)
+            
+            # Generate negatives (ω = 1)
+            negative_triples = self.negative_sampling_paper(train_triples, num_entities)
+            neg_heads = entity_embeddings[negative_triples[:, 0]]
+            neg_rels = rgcn_model.relation_embedding(negative_triples[:, 1])
+            neg_tails = entity_embeddings[negative_triples[:, 2]]
+            negative_scores = rgcn_model.distmult_score(neg_heads, neg_rels, neg_tails)
+            
+            # Margin ranking loss (paper default)
+            margin = 1.0
+            ranking_loss = F.relu(margin + negative_scores - positive_scores).mean()
+            
+            # L2 regularization on decoder (relation embeddings) - paper: 0.01
+            l2_loss = self.l2_penalty * rgcn_model.relation_embedding.weight.norm(2).pow(2)
+            
+            total_loss = ranking_loss + l2_loss
+            
+            optimizer.zero_grad()
+            total_loss.backward()
+            
+            # Gradient clipping (standard practice)
+            torch.nn.utils.clip_grad_norm_(rgcn_model.parameters(), 1.0)
+            
+            optimizer.step()
+            
+            if verbose and epoch % 20 == 0:
+                print(f"  R-GCN Epoch {epoch}: Total Loss = {total_loss.item():.4f} (Ranking: {ranking_loss.item():.4f}, L2: {l2_loss.item():.6f})")
+        
+        with torch.no_grad():
+            final_node_embeddings = rgcn_model.forward_entities(edge_index, edge_type)
+            final_rel_embeddings = rgcn_model.relation_embedding.weight
+        
+        if verbose:
+            print("R-GCN training complete")
+        return final_node_embeddings, final_rel_embeddings
+    
+    def get_name(self):
+        return "R-GCN (Paper)"
+
+# =============================================================================
+# EMBEDDING INITIALIZATION METHODS 
 # =============================================================================
 
 class EmbeddingInitializer(ABC):
@@ -224,101 +409,6 @@ class RandomInitializer(EmbeddingInitializer):
     
     def get_name(self):
         return "Random"
-
-class RGCNDistMult(nn.Module):
-    def __init__(self, num_entities, num_relations, hidden_dim=128, num_bases=None, num_layers=2):
-        super().__init__()
-        
-        self.num_entities = num_entities
-        self.num_relations = num_relations
-        self.hidden_dim = hidden_dim
-        
-        if num_bases is None:
-            num_bases = min(num_relations, max(25, num_relations // 4))
-        
-        self.entity_embedding = nn.Embedding(num_entities, hidden_dim)
-        self.relation_embedding = nn.Embedding(num_relations, hidden_dim)
-        
-        self.layers = nn.ModuleList()
-        for i in range(num_layers):
-            layer = RGCNConv(hidden_dim, hidden_dim, num_relations, num_bases=num_bases)
-            self.layers.append(layer)
-        
-        nn.init.xavier_uniform_(self.entity_embedding.weight)
-        nn.init.xavier_uniform_(self.relation_embedding.weight)
-        
-        self.dropout = nn.Dropout(0.2)
-    
-    def forward_entities(self, edge_index, edge_type):
-        x = self.entity_embedding.weight
-        for layer in self.layers:
-            x = layer(x, edge_index, edge_type)
-            x = F.relu(x)
-            x = self.dropout(x)
-        return x
-
-class RGCNInitializer(EmbeddingInitializer):
-    def __init__(self, embed_dim=128, epochs=100, lr=0.01, layers=2):
-        self.embed_dim = embed_dim
-        self.epochs = epochs
-        self.lr = lr
-        self.layers = layers
-    
-    def initialize_embeddings(self, train_df, val_df, test_df, num_entities, num_relations, device, verbose=True):
-        if verbose:
-            print(f"Training R-GCN embeddings ({self.epochs} epochs)...")
-        
-        # Build graph
-        all_data = pd.concat([train_df, val_df, test_df])
-        all_triples = torch.tensor(all_data.values, dtype=torch.long)
-        edge_index = all_triples[:, [0, 2]].t().contiguous().to(device)
-        edge_type = all_triples[:, 1].to(device)
-        
-        rgcn_model = RGCNDistMult(num_entities, num_relations, self.embed_dim, num_layers=self.layers).to(device)
-        optimizer = optim.Adam(rgcn_model.parameters(), lr=self.lr)
-        
-        train_triples = torch.tensor(train_df.values, dtype=torch.long).to(device)
-        
-        for epoch in range(self.epochs):
-            rgcn_model.train()
-            optimizer.zero_grad()
-            
-            entity_embeddings = rgcn_model.forward_entities(edge_index, edge_type)
-            
-            batch_size = min(1024, len(train_triples))
-            batch_idx = torch.randperm(len(train_triples))[:batch_size]
-            batch_triples = train_triples[batch_idx]
-            
-            h, r, t = batch_triples[:, 0], batch_triples[:, 1], batch_triples[:, 2]
-            
-            h_emb = entity_embeddings[h]
-            t_emb = entity_embeddings[t]
-            r_emb = rgcn_model.relation_embedding(r)
-            
-            pos_sim = F.cosine_similarity(h_emb + r_emb, t_emb, dim=1)
-            
-            neg_tails = torch.randint(0, num_entities, (batch_size,), device=device)
-            neg_t_emb = entity_embeddings[neg_tails]
-            neg_sim = F.cosine_similarity(h_emb + r_emb, neg_t_emb, dim=1)
-            
-            loss = F.relu(0.5 + neg_sim - pos_sim).mean()
-            
-            loss.backward()
-            optimizer.step()
-            
-            if verbose and epoch % 20 == 0:
-                print(f"  R-GCN Epoch {epoch}: Loss = {loss.item():.4f}")
-        
-        with torch.no_grad():
-            final_node_embeddings = rgcn_model.forward_entities(edge_index, edge_type)
-            final_rel_embeddings = rgcn_model.relation_embedding.weight
-        
-        if verbose:
-            print("R-GCN training complete")
-        return final_node_embeddings, final_rel_embeddings
-    
-    def get_name(self):
-        return "R-GCN"
 
 class TransEInitializer(EmbeddingInitializer):
     """TransE initialization with translational embeddings"""
@@ -541,7 +631,7 @@ def create_embedding_initializer(args):
     """Factory function to create embedding initializer"""
     method = args.embedding_init.lower()
     if method == 'rgcn':
-        return RGCNInitializer(args.embed_dim, args.rgcn_epochs, args.rgcn_lr, args.rgcn_layers)
+        return RGCNInitializer(args.embed_dim, args.rgcn_epochs, args.rgcn_lr, args.rgcn_layers, args.rgcn_l2_penalty)
     elif method == 'random':
         return RandomInitializer(args.embed_dim)
     elif method == 'transe':
@@ -608,7 +698,7 @@ def resolve_reward_method(embedding_method, reward_method):
     return reward_method
 
 # =============================================================================
-# UTILITY FUNCTIONS
+# UTILITY FUNCTIONS 
 # =============================================================================
 
 def print_progress(message, verbose=True, display_mode='detailed'):
@@ -725,26 +815,82 @@ def generate_balanced_hard_negatives(h_emb, r_emb, node_emb, num_hard=10, num_me
     
     return all_neg_idxs
 
+# UPDATED METRICS FUNCTIONS FROM YOUR NON-MODULAR CODE
+def avg_pairwise_cosine_similarity(tensors):
+    norm = F.normalize(tensors, dim=-1)
+    sim_matrix = torch.matmul(norm, norm.T)
+    upper_tri = sim_matrix.triu(1)
+    return upper_tri[upper_tri != 0].mean().item()
+
+def compute_variance(tensors):
+    return torch.var(tensors, dim=0).mean().item()
+
+def compute_topk_diversity(fake_embeds, all_node_embeds, k=10):
+    sims = torch.matmul(F.normalize(fake_embeds, dim=-1),
+                        F.normalize(all_node_embeds, dim=-1).T)
+    topk = sims.topk(k, dim=1).indices.view(-1).cpu().numpy()
+    unique = len(set(topk))
+    return unique / len(topk)
+
+def print_enhanced_discriminator_metrics(true_labels, pred_probs, epoch, display_mode='detailed', detailed_metrics=True):
+    """Enhanced discriminator metrics with health assessment (from your non-modular code)"""
+    if not true_labels:
+        return {"F1": 0, "AUPR": 0, "MCC": 0, "AUC": 0, "Precision": 0, "Recall": 0, "Gap": 0}
+    
+    y_true = np.array(true_labels)
+    y_probs = np.array(pred_probs)
+    
+    # Calculate discriminator gap
+    real_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 1]
+    fake_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 0]
+    gap = np.mean(real_probs) - np.mean(fake_probs) if real_probs and fake_probs else 0
+    
+    metrics = compute_metrics(y_true, y_probs)
+    
+    # Additional metrics
+    y_pred = (y_probs >= 0.5).astype(int)
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    
+    enhanced_metrics = {
+        **metrics,
+        "Precision": precision,
+        "Recall": recall,
+        "Gap": gap
+    }
+    
+    # Health assessment (only if detailed metrics enabled)
+    if detailed_metrics and display_mode == 'detailed':
+        if gap > 0.05 and metrics['F1'] > 0.60:
+            status = "✅ HEALTHY (like your original F1=0.67!)"
+        elif gap > 0.03 and metrics['F1'] > 0.50:
+            status = "⚠️ WEAK but learning"
+        elif gap < 0.01:
+            status = "❌ BROKEN (like before the fix)"
+        else:
+            status = "🔄 LEARNING"
+        
+        print(f" Discriminator Health: Gap={gap:.3f} F1={metrics['F1']:.3f} Precision={precision:.3f} Recall={recall:.3f} AUC={metrics['AUC']:.3f}")
+        print(f"   Status: {status}")
+    
+    return enhanced_metrics
+
 # =============================================================================
 #  COMPOSITE RL LOSS FUNCTION 
 # =============================================================================
 
 def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, args, 
                                     true_labels=None, pred_probs=None):
-    """
-    IMPROVED:  RL loss with discriminator health monitoring and gradual transition
-    """
-    
     device = h_emb.device
     
     if epoch < args.rl_start_epoch:
         return torch.tensor(0.0, device=device), {}
     
     elif epoch < args.full_system_epoch:
-        # TIER 2: DistMult-only RL (EXTENDED DURATION)
+        # TIER 2: DistMult-only RL with ultra-aggressive temperature scaling
         dm_scores = (h_emb * r_emb * fake).sum(dim=-1)
         # Ultra-aggressive temperature scaling to prevent saturation
-        dm_component = torch.sigmoid(dm_scores / 100.0)  # Prevent saturation
+        dm_component = torch.sigmoid(dm_scores / 100.0)  # Was /20.0, now /100.0 for maximum responsiveness
         simple_reward = dm_component - 0.5
         rl_loss = -simple_reward.mean()
         
@@ -763,41 +909,25 @@ def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, a
             disc_scores = discriminator(h_emb.detach(), r_emb.detach(), fake.detach())
             disc_component = torch.sigmoid(disc_scores)
         
-        # IMPROVED: Discriminator health assessment
+        # Discriminator health assessment
         if true_labels is not None and pred_probs is not None and len(true_labels) > 0:
             current_disc_f1 = compute_metrics(np.array(true_labels), np.array(pred_probs))['F1']
         else:
             current_disc_f1 = 0.3  # Conservative fallback
         
-        # IMPROVED: Gradual transition based on discriminator health AND epoch
-        epochs_in_tier3 = epoch - args.full_system_epoch + 1
-        
-        if current_disc_f1 < 0.3:  # Discriminator too weak - emergency protection
-            disc_weight = 0.05
-            dm_weight = 0.95
-            status = f"EMERGENCY (F1={current_disc_f1:.3f})"
-        elif current_disc_f1 < 0.45:  # Discriminator weak - heavy protection
-            disc_weight = 0.1 + 0.05 * min(epochs_in_tier3, 10)  # Gradual from 0.1 to 0.6
-            dm_weight = 1.0 - disc_weight
-            status = f"WEAK (F1={current_disc_f1:.3f})"
-        elif current_disc_f1 < 0.55:  # Discriminator learning - moderate protection
-            disc_weight = 0.2 + 0.05 * min(epochs_in_tier3, 8)   # Gradual from 0.2 to 0.6
-            dm_weight = 1.0 - disc_weight
-            status = f"LEARNING (F1={current_disc_f1:.3f})"
-        else:  # Discriminator healthy - balanced training
-            # Gradual transition to balanced 0.5/0.5 over time
-            target_disc_weight = 0.5
-            transition_epochs = 15
-            if epochs_in_tier3 <= transition_epochs:
-                disc_weight = 0.3 + (target_disc_weight - 0.3) * (epochs_in_tier3 / transition_epochs)
-            else:
-                disc_weight = target_disc_weight
-            dm_weight = 1.0 - disc_weight
-            status = f"HEALTHY (F1={current_disc_f1:.3f})"
-        
-        # Ensure weights are reasonable
-        disc_weight = max(0.05, min(0.7, disc_weight))
-        dm_weight = 1.0 - disc_weight
+        # Gradual transition based on discriminator health
+        if current_disc_f1 < 0.3:  # Discriminator too weak
+            disc_weight = 0.1
+            dm_weight = 0.9
+            protection_status = f"WEAK (F1={current_disc_f1:.3f}), using 0.1/0.9"
+        elif current_disc_f1 < 0.5:  # Discriminator learning
+            disc_weight = 0.3
+            dm_weight = 0.7
+            protection_status = f"LEARNING (F1={current_disc_f1:.3f}), using 0.3/0.7"
+        else:  # Discriminator healthy
+            disc_weight = 0.5
+            dm_weight = 0.5
+            protection_status = f"HEALTHY (F1={current_disc_f1:.3f}), using 0.5/0.5"
         
         composite_reward = disc_weight * disc_component + dm_weight * dm_component - 0.5
         rl_loss = -composite_reward.mean()
@@ -810,53 +940,11 @@ def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, a
             'dm_weight': dm_weight,
             'disc_f1': current_disc_f1,
             'tier': 3,
-            'status': status,
-            'epochs_in_tier3': epochs_in_tier3
+            'protection_status': protection_status
         }
 
-# =============================================================================
-# DISCRIMINATOR READINESS CHECK
-# =============================================================================
-def check_discriminator_readiness(true_labels, pred_probs, min_f1=0.45, min_gap=0.02):
-    """
-    Check if discriminator is ready for full adversarial training
-    
-    Args:
-        true_labels: List of true labels (1 for real, 0 for fake)
-        pred_probs: List of predicted probabilities
-        min_f1: Minimum F1 score required
-        min_gap: Minimum gap between real and fake probabilities
-    
-    Returns:
-        bool: True if discriminator is ready, False otherwise
-    """
-    if not true_labels or not pred_probs:
-        return False
-    
-    try:
-        y_true = np.array(true_labels)
-        y_probs = np.array(pred_probs)
-        
-        # Calculate F1 score
-        metrics = compute_metrics(y_true, y_probs)
-        f1_score = metrics['F1']
-        
-        # Calculate gap between real and fake probabilities
-        real_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 1]
-        fake_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 0]
-        gap = np.mean(real_probs) - np.mean(fake_probs) if real_probs and fake_probs else 0
-        
-        # Check readiness criteria
-        f1_ready = f1_score >= min_f1
-        gap_ready = gap >= min_gap
-        
-        return f1_ready and gap_ready
-        
-    except Exception:
-        return False
-
 def bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb):
-    """ bias mitigation approach"""
+    """Your exact bias mitigation approach"""
     with torch.no_grad():
         sim = torch.matmul(F.normalize(t_emb, dim=-1), F.normalize(node_emb, dim=-1).T)
         _, hard_neg_idx = sim.topk(3, dim=1)
@@ -872,46 +960,6 @@ def bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb):
     diversity_loss = torch.exp(-2 * batch_var)
     
     return margin_loss + 0.1 * diversity_loss
-
-def print_enhanced_discriminator_metrics(true_labels, pred_probs, epoch, display_mode='detailed'):
-    """Discriminator metrics with health assessment"""
-    if not true_labels:
-        return {"F1": 0, "AUPR": 0, "MCC": 0, "AUC": 0, "Precision": 0, "Recall": 0, "Gap": 0}
-    
-    y_true = np.array(true_labels)
-    y_probs = np.array(pred_probs)
-    
-    real_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 1]
-    fake_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 0]
-    gap = np.mean(real_probs) - np.mean(fake_probs) if real_probs and fake_probs else 0
-    
-    metrics = compute_metrics(y_true, y_probs)
-    
-    y_pred = (y_probs >= 0.5).astype(int)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    
-    enhanced_metrics = {
-        **metrics,
-        "Precision": precision,
-        "Recall": recall,
-        "Gap": gap
-    }
-    
-    if display_mode == 'detailed':
-        if gap > 0.05 and metrics['F1'] > 0.60:
-            status = "✅ HEALTHY"
-        elif gap > 0.03 and metrics['F1'] > 0.50:
-            status = "⚠️ WEAK but learning"
-        elif gap < 0.01:
-            status = "❌ BROKEN"
-        else:
-            status = "🔄 LEARNING"
-        
-        print(f" Discriminator Health: Gap={gap:.3f} F1={metrics['F1']:.3f} Precision={precision:.3f} Recall={recall:.3f}")
-        print(f"   Status: {status}")
-    
-    return enhanced_metrics
 
 # =============================================================================
 # DATA LOADING
@@ -977,11 +1025,11 @@ def load_data(args):
     return train_df, val_df, test_df, num_entities, num_relations
 
 # =============================================================================
-# MAIN TRAINING FUNCTION
+# MAIN TRAINING FUNCTION (UPDATED WITH YOUR METRICS)
 # =============================================================================
 
 def train_modular_prot_b_gan(args):
-    """Main training function with  tiered system made modular"""
+    """Main training function with tiered system made modular and your metrics"""
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print_progress(f"Modular Prot-B-GAN Training", args.verbose, args.display_mode)
@@ -1016,6 +1064,19 @@ def train_modular_prot_b_gan(args):
         
         print_progress(f"Embeddings ready: Nodes {node_emb.shape}, Relations {rel_emb.weight.shape}", args.verbose, args.display_mode)
         
+        # BASELINE EVALUATION AFTER EMBEDDING INITIALIZATION
+        print_progress(f"\nSTAGE 1.5: Baseline Evaluation (Post-Embedding)", args.verbose, args.display_mode)
+        
+        baseline_train_hit_at_k = evaluate_hit_at_k(train_loader, None, node_emb, rel_emb, device, args.hit_at_k)
+        baseline_val_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k)
+        baseline_test_hit_at_k = evaluate_hit_at_k(test_loader, None, node_emb, rel_emb, device, args.hit_at_k)
+        
+        print_progress(f"BASELINE RESULTS ({args.embedding_init.upper()}):", args.verbose, args.display_mode)
+        print_progress("Train: " + " ".join([f"Hit@{k}: {baseline_train_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
+        print_progress("Val:   " + " ".join([f"Hit@{k}: {baseline_val_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
+        print_progress("Test:  " + " ".join([f"Hit@{k}: {baseline_test_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
+        print_progress("=" * 70, args.verbose, args.display_mode)
+        
         # Initialize models
         print_progress(f"STAGE 2: Model Architecture Setup", args.verbose, args.display_mode)
         
@@ -1032,26 +1093,31 @@ def train_modular_prot_b_gan(args):
         best_val_hit10 = 0.0
         best_epoch = 0
         
-        #  training schedule
-        print_progress(f"STAGE 3:  Tiered Training System", args.verbose, args.display_mode)
+        # Training schedule
+        print_progress(f"STAGE 3: Tiered Training System", args.verbose, args.display_mode)
         print_progress(f"  Tier 1 (Epochs 1-{args.pretrain_epochs}): Pretraining", args.verbose, args.display_mode)
         print_progress(f"  Tier 2 (Epochs +{args.rl_start_epoch}): + RL (DistMult)", args.verbose, args.display_mode)
         print_progress(f"  Tier 3 (Epochs +{args.full_system_epoch}): + Full Adversarial", args.verbose, args.display_mode)
         
-        # Training history
+        # Training history (from your non-modular code)
         training_history = {
-            'losses': [], 'd_losses': [], 'g_losses': [],
+            'losses': [], 'd_losses': [], 'g_losses': [], 'cossims': [],
             'train_hitks': {k: [] for k in args.hit_at_k},
             'val_hitks': {k: [] for k in args.hit_at_k},
-            'f1_history': [], 'val_f1_history': []
+            'f1_history': [], 'val_f1_history': [],
+            'aupr_history': [], 'val_aupr_history': [],
+            'mcc_history': [], 'val_mcc_history': [],
+            'auc_history': [], 'val_auc_history': [],
+            'real_acc_list': [], 'fake_acc_list': [],
+            'collapse_hist': deque(maxlen=5), 'diversity_hist': deque(maxlen=5)
         }
         
         bce_loss = nn.BCEWithLogitsLoss()
         
-        #  TRAINING LOOP PRESERVED
+        # MAIN TRAINING LOOP
         for epoch in range(1, args.epochs + 1):
             
-            # PRETRAINING PHASE ( logic)
+            # PRETRAINING PHASE
             if epoch <= args.pretrain_epochs:
                 generator.train()
                 
@@ -1089,7 +1155,7 @@ def train_modular_prot_b_gan(args):
                     print_progress(f"[Pretraining] Epoch {epoch}: Basic generator training", args.verbose, args.display_mode)
                 continue
             
-            #  (Tiers 2 & 3)
+            # ADVANCED TRAINING (Tiers 2 & 3)
             if epoch == args.pretrain_epochs + 1:
                 node_emb.requires_grad_(False)
                 g_opt = optim.Adam(generator.parameters(), lr=1e-4)
@@ -1109,7 +1175,7 @@ def train_modular_prot_b_gan(args):
                 h, r, t = [b.to(device) for b in batch.T]
                 h_emb, r_emb_batch, t_emb = node_emb[h], rel_emb(r), node_emb[t]
                 
-                # DISCRIMINATOR TRAINING 
+                # DISCRIMINATOR TRAINING
                 if step % args.d_update_freq == 0:
                     d_opt.zero_grad()
                     
@@ -1120,7 +1186,7 @@ def train_modular_prot_b_gan(args):
                     fake_scores = discriminator(h_emb.detach(), r_emb_batch.detach(), fake_samples)
                     
                     neg_indices = generate_balanced_hard_negatives(h_emb.detach(), r_emb_batch.detach(), node_emb,
-                                                                  num_hard=10, num_medium=8, num_easy=7)
+                                                                  num_hard=30, num_medium=8, num_easy=7)  # Using your values
                     
                     batch_size = h_emb.shape[0]
                     selected_neg_idx = torch.randint(0, neg_indices.shape[1], (batch_size,), device=h_emb.device)
@@ -1140,13 +1206,18 @@ def train_modular_prot_b_gan(args):
                     d_opt.step()
                     total_d_loss += d_loss.item()
                     
-                    # Track discriminator performance
+                    # Track discriminator performance (your metrics)
                     with torch.no_grad():
-                        all_real_scores = real_scores
-                        all_fake_scores = torch.cat([fake_scores, hard_neg_scores])
+                        real_preds = (torch.sigmoid(real_scores) > 0.5).float()
+                        fake_preds = (torch.sigmoid(torch.cat([fake_scores, hard_neg_scores])) <= 0.5).float()
+                        real_acc = real_preds.mean().item()
+                        fake_acc = fake_preds.mean().item()
                         
-                        true_labels.extend([1]*len(all_real_scores) + [0]*len(all_fake_scores))
-                        pred_probs.extend(torch.sigmoid(torch.cat([all_real_scores, all_fake_scores])).cpu().numpy())
+                        training_history['real_acc_list'].append(real_acc)
+                        training_history['fake_acc_list'].append(fake_acc)
+                        
+                        true_labels.extend([1]*len(real_scores) + [0]*(len(fake_scores) + len(hard_neg_scores)))
+                        pred_probs.extend(torch.sigmoid(torch.cat([real_scores, fake_scores, hard_neg_scores])).cpu().numpy())
                 
                 # GENERATOR TRAINING
                 g_opt.zero_grad()
@@ -1163,16 +1234,16 @@ def train_modular_prot_b_gan(args):
                 dm_loss = -torch.tanh(dm_scores / 10.0).mean()
                 loss_components.append(args.distmult_weight * dm_loss)
                 
-                #  RL loss
+                # Your RL loss
                 rl_loss, rl_metrics = compute_composite_rl_loss(
                     epoch, h_emb, r_emb_batch, fake, t_emb, discriminator, args,
-                    true_labels=true_labels,  # Pass current batch labels
-                    pred_probs=pred_probs     # Pass current batch probabilities
+                    true_labels=true_labels,
+                    pred_probs=pred_probs
                 )
                 if rl_loss.item() != 0:
                     loss_components.append(args.rl_weight * rl_loss)
                 
-                #  bias mitigation
+                # Bias mitigation
                 bias_loss = bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb_batch)
                 loss_components.append(args.bias_weight * bias_loss)
                 
@@ -1182,7 +1253,7 @@ def train_modular_prot_b_gan(args):
                     adv_loss = -torch.tanh(adv_scores / 5.0).mean()
                     loss_components.append(args.adv_weight * adv_loss)
                 
-                #  cosine margin and diversity losses
+                # Cosine margin and diversity losses
                 batch_size = h_emb.shape[0]
                 rand_k = args.n_neg - args.hard_neg_k
                 rand_idxs = torch.randint(0, node_emb.size(0), (batch_size, rand_k), device=device)
@@ -1211,19 +1282,25 @@ def train_modular_prot_b_gan(args):
                     total_loss += final_loss.item()
                     total_cos += cos_sim
             
-            # EPOCH EVALUATION
+            # EPOCH EVALUATION (YOUR STYLE)
             effective_steps = min(len(train_loader), args.max_debug_steps if args.debug else len(train_loader))
             avg_loss = total_loss / effective_steps if effective_steps > 0 else 0.0
             avg_cos = total_cos / effective_steps if effective_steps > 0 else 0.0
+            avg_d_loss = total_d_loss / max(1, effective_steps // args.d_update_freq)
+            avg_g_loss = total_g_loss / effective_steps
             
             # Update history
             training_history['losses'].append(avg_loss)
-            training_history['d_losses'].append(total_d_loss / max(1, effective_steps // args.d_update_freq))
-            training_history['g_losses'].append(total_g_loss)
+            training_history['cossims'].append(avg_cos)
+            training_history['d_losses'].append(avg_d_loss)
+            training_history['g_losses'].append(avg_g_loss)
             
-            # Discriminator metrics
-            enhanced_metrics = print_enhanced_discriminator_metrics(true_labels, pred_probs, epoch, args.display_mode)
+            # Discriminator metrics (your enhanced version)
+            enhanced_metrics = print_enhanced_discriminator_metrics(true_labels, pred_probs, epoch, args.display_mode, args.detailed_metrics)
             training_history['f1_history'].append(enhanced_metrics['F1'])
+            training_history['aupr_history'].append(enhanced_metrics['AUPR'])
+            training_history['mcc_history'].append(enhanced_metrics['MCC'])
+            training_history['auc_history'].append(enhanced_metrics['AUC'])
             
             # Hit@K evaluation
             train_hit_at_k = evaluate_hit_at_k(train_loader, generator, node_emb, rel_emb, device, args.hit_at_k)
@@ -1232,17 +1309,31 @@ def train_modular_prot_b_gan(args):
             
             val_metrics, val_cos_avg = validate(val_loader, generator, discriminator, node_emb, rel_emb, device)
             training_history['val_f1_history'].append(val_metrics['F1'])
+            training_history['val_aupr_history'].append(val_metrics['AUPR'])
+            training_history['val_mcc_history'].append(val_metrics['MCC'])
+            training_history['val_auc_history'].append(val_metrics['AUC'])
             
             val_hit_at_k = evaluate_hit_at_k(val_loader, generator, node_emb, rel_emb, device, args.hit_at_k)
             for k in args.hit_at_k:
                 training_history['val_hitks'][k].append(val_hit_at_k[k])
+            
+            # Calculate collapse and diversity metrics (your additional metrics)
+            if args.detailed_metrics:
+                with torch.no_grad():
+                    fake_eval = generator(h_emb, r_emb_batch).detach()
+                    collapse_score = avg_pairwise_cosine_similarity(fake_eval)
+                    variance_score = compute_variance(fake_eval)
+                    diversity_score = compute_topk_diversity(fake_eval, node_emb)
+                    
+                    training_history['collapse_hist'].append(collapse_score)
+                    training_history['diversity_hist'].append(diversity_score)
             
             # Save best model
             if val_hit_at_k[10] > best_val_hit10:
                 best_val_hit10 = val_hit_at_k[10]
                 best_epoch = epoch
                 
-                # Save modular checkpoint
+                # Save checkpoint
                 os.makedirs(args.output_dir, exist_ok=True)
                 checkpoint_path = os.path.join(args.output_dir, "best_checkpoint.pt")
                 torch.save({
@@ -1254,23 +1345,50 @@ def train_modular_prot_b_gan(args):
                     "best_val_hit10": best_val_hit10,
                     "best_epoch": best_epoch,
                     "args": vars(args),
-                    "training_history": training_history
+                    "training_history": training_history,
+                    "baseline_results": {
+                        "train": baseline_train_hit_at_k,
+                        "val": baseline_val_hit_at_k,
+                        "test": baseline_test_hit_at_k
+                    }
                 }, checkpoint_path)
             
-            # Progress display
+            # Progress display (your style)
             tier_name = "Pretraining" if epoch <= args.pretrain_epochs else f"Tier {2 if epoch < args.pretrain_epochs + args.full_system_epoch else 3}"
             
+            # Enhanced RL information display (your style)
+            rl_info = ""
+            if epoch >= args.rl_start_epoch:
+                if epoch < args.pretrain_epochs + args.full_system_epoch:
+                    rl_info = f" | RL_DM: {rl_metrics.get('dm_component', 0):.3f} (Tier 2)"
+                else:
+                    rl_disc = rl_metrics.get('disc_component', 0)
+                    rl_dm = rl_metrics.get('dm_component', 0)
+                    protection = rl_metrics.get('protection_status', 'Unknown')
+                    rl_info = f" | RL_Disc: {rl_disc:.3f} RL_DM: {rl_dm:.3f} (Tier 3 - {protection})"
+            
             if args.display_mode == 'simple':
-                print_progress(f"E{epoch:03d} [{tier_name}] Loss {avg_loss:.4f} F1 {enhanced_metrics['F1']:.3f} Hit@10 {val_hit_at_k[10]:.4f}", 
+                print_progress(f"E{epoch:03d} [{tier_name}] Loss {avg_loss:.4f} F1 {enhanced_metrics['F1']:.3f} Hit@10 {val_hit_at_k[10]:.4f}{rl_info}", 
                               args.verbose, args.display_mode)
             else:
                 print_progress(f"[{tier_name}] E{epoch:03d} | Loss {avg_loss:.4f} | CosSim {avg_cos:.3f} | "
-                              f"F1 {enhanced_metrics['F1']:.4f}", args.verbose, args.display_mode)
+                              f"F1 {enhanced_metrics['F1']:.4f} AUPR {enhanced_metrics['AUPR']:.4f} "
+                              f"MCC {enhanced_metrics['MCC']:.4f} AUC {enhanced_metrics['AUC']:.4f}{rl_info}", args.verbose, args.display_mode)
                 
                 print_progress("Train: " + " ".join([f"Hit@{k}: {train_hit_at_k[k]:.4f}" for k in args.hit_at_k]), 
                               args.verbose, args.display_mode)
                 print_progress("Val:   " + " ".join([f"Hit@{k}: {val_hit_at_k[k]:.4f}" for k in args.hit_at_k]) + 
-                              f" | F1 {val_metrics['F1']:.4f}", args.verbose, args.display_mode)
+                              f" | VAL_F1 {val_metrics['F1']:.4f} VAL_AUPR {val_metrics['AUPR']:.4f}", args.verbose, args.display_mode)
+                
+                if args.detailed_metrics:
+                    print_progress(f"Collapse: {collapse_score:.3f} | Diversity: {diversity_score:.3f} | Variance: {variance_score:.5f}", 
+                                  args.verbose, args.display_mode)
+            
+            # Tier transition announcements (your style)
+            if epoch == args.rl_start_epoch:
+                print_progress(f" 🎯 TIER 2: RL system activated (DistMult only) - Ultra-aggressive temp scaling (÷100)!", args.verbose, args.display_mode)
+            elif epoch == args.pretrain_epochs + args.full_system_epoch:
+                print_progress(f" 🎯 TIER 3: Full composite RL + Adversarial system - Adaptive weights based on discriminator health!", args.verbose, args.display_mode)
             
             # Early stopping
             if epoch - best_epoch > args.early_stopping_patience:
@@ -1289,6 +1407,11 @@ def train_modular_prot_b_gan(args):
         for k in args.hit_at_k:
             print_progress(f"Test Hit@{k}: {test_hit_at_k[k]:.4f} ({test_hit_at_k[k]*100:.1f}%)", args.verbose, args.display_mode)
         
+        print_progress(f"\nIMPROVEMENT OVER BASELINE:", args.verbose, args.display_mode)
+        for k in args.hit_at_k:
+            improvement = test_hit_at_k[k] - baseline_test_hit_at_k[k]
+            print_progress(f"Hit@{k}: {improvement:+.4f} ({improvement*100:+.1f}%)", args.verbose, args.display_mode)
+        
         if args.display_mode == 'detailed':
             print_progress(f"\nDISCRIMINATOR FINAL HEALTH:", args.verbose, args.display_mode)
             print_progress(f"   F1 Score: {final_val_metrics['F1']:.3f}", args.verbose, args.display_mode)
@@ -1302,6 +1425,7 @@ def train_modular_prot_b_gan(args):
             "node_emb": node_emb,
             "rel_emb": rel_emb,
             "test_hit_at_k": test_hit_at_k,
+            "baseline_hit_at_k": baseline_test_hit_at_k,
             "best_val_hit10": best_val_hit10,
             "training_history": training_history,
             "device": device
@@ -1312,11 +1436,11 @@ def train_modular_prot_b_gan(args):
         return None
 
 # =============================================================================
-# COMMAND LINE INTERFACE
+# COMMAND LINE INTERFACE (UPDATED WITH NEW PARAMETERS)
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Modular Prot-B-GAN with  Tiered Training System')
+    parser = argparse.ArgumentParser(description='Modular Prot-B-GAN with Tiered Training System')
     
     # Data paths
     parser.add_argument('--data_root', type=str, required=True, help='Root directory containing data files')
@@ -1345,10 +1469,11 @@ def main():
                         choices=['distmult', 'transe', 'auto'],
                         help='Reward scoring method')
     
-    # R-GCN specific
+    # R-GCN specific (updated)
     parser.add_argument('--rgcn_epochs', type=int, default=100, help='R-GCN training epochs')
     parser.add_argument('--rgcn_lr', type=float, default=0.01, help='R-GCN learning rate')
     parser.add_argument('--rgcn_layers', type=int, default=2, help='R-GCN layers')
+    parser.add_argument('--rgcn_l2_penalty', type=float, default=0.01, help='R-GCN L2 penalty')
 
     # TransE specific parameters
     parser.add_argument('--transe_epochs', type=int, default=100, help='TransE training epochs')
@@ -1365,13 +1490,13 @@ def main():
     parser.add_argument('--complex_lr', type=float, default=0.01, help='ComplEx learning rate')
     parser.add_argument('--complex_regularization', type=float, default=0.01, help='ComplEx L2 regularization')
     
-    #  tiered training schedule
+    # Tiered training schedule
     parser.add_argument('--pretrain_epochs', type=int, default=90, help='Pretraining epochs')
     parser.add_argument('--rl_start_epoch', type=int, default=20, help='RL start epoch (Tier 2)')
     parser.add_argument('--full_system_epoch', type=int, default=25, help='Full system epoch (Tier 3)')
     parser.add_argument('--d_update_freq', type=int, default=10, help='Discriminator update frequency')
     
-    #  loss weights
+    # Loss weights
     parser.add_argument('--rl_weight', type=float, default=0.1, help='RL loss weight')
     parser.add_argument('--adv_weight', type=float, default=0.05, help='Adversarial loss weight')
     parser.add_argument('--refinement_weight', type=float, default=0.7, help='Refinement loss weight')
@@ -1390,9 +1515,11 @@ def main():
     parser.add_argument('--hit_at_k', type=int, nargs='+', default=[1, 5, 10], help='Hit@K values')
     parser.add_argument('--early_stopping_patience', type=int, default=30, help='Early stopping patience')
     
-    # Display and debug options
+    # Display and debug options (UPDATED)
     parser.add_argument('--display_mode', type=str, default='detailed', choices=['simple', 'detailed'],
                         help='Display mode: simple (one-line) or detailed (multi-line)')
+    parser.add_argument('--detailed_metrics', action='store_true', default=True, 
+                        help='Enable detailed metric tracking (collapse, diversity, enhanced discriminator metrics)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
     
@@ -1404,10 +1531,11 @@ def main():
     
     args = parser.parse_args()
     
-    print(f"MODULAR PROT-B-GAN with  TIERED SYSTEM")
+    print(f"MODULAR PROT-B-GAN with TIERED SYSTEM (UPDATED)")
     print(f"  Embedding Init: {args.embedding_init.upper()}")
     print(f"  Reward Method: {args.reward_scoring_method.upper()}")
     print(f"  Display Mode: {args.display_mode}")
+    print(f"  Detailed Metrics: {args.detailed_metrics}")
     print(f"  Debug Mode: {args.debug}")
     
     # Run training
@@ -1416,6 +1544,9 @@ def main():
     if results:
         print(f"\nSUCCESS! Training completed")
         print(f"Best validation Hit@10: {results['best_val_hit10']:.4f}")
+        print(f"Baseline Test Hit@10: {results['baseline_hit_at_k'][10]:.4f}")
+        print(f"Final Test Hit@10: {results['test_hit_at_k'][10]:.4f}")
+        print(f"Improvement: {results['test_hit_at_k'][10] - results['baseline_hit_at_k'][10]:+.4f}")
         print(f"Models saved to: {args.output_dir}")
         return 0
     else:
