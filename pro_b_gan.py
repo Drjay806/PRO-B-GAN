@@ -27,8 +27,16 @@ import torch.optim as optim
 import pandas as pd
 import pickle
 import argparse
+try:
+    from torch_geometric.nn import RGCNConv
+    TORCH_GEOMETRIC_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: torch_geometric not available: {e}")
+    print("R-GCN embedding initialization will not work.")
+    print("Install with: pip install torch-geometric")
+    TORCH_GEOMETRIC_AVAILABLE = False
+    RGCNConv = None  # Placeholder
 from torch.utils.data import Dataset, DataLoader
-from torch_geometric.nn import RGCNConv
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, average_precision_score, matthews_corrcoef, roc_auc_score, precision_score, recall_score
 from sklearn.decomposition import PCA
@@ -193,7 +201,20 @@ class Discriminator(nn.Module):
             return scores.cpu().numpy(), probabilities.cpu().numpy()
 
 # =============================================================================
-# UPDATED RGCN IMPLEMENTATION (PAPER-ALIGNED)
+# EMBEDDING INITIALIZATION METHODS (ABSTRACT BASE CLASS FIRST)
+# =============================================================================
+
+class EmbeddingInitializer(ABC):
+    @abstractmethod
+    def initialize_embeddings(self, train_df, val_df, test_df, num_entities, num_relations, device, verbose=True):
+        pass
+    
+    @abstractmethod
+    def get_name(self):
+        pass
+
+# =============================================================================
+#  RGCN IMPLEMENTATION (PAPER-ALIGNED)
 # =============================================================================
 
 class RGCNDistMult(nn.Module):
@@ -203,6 +224,9 @@ class RGCNDistMult(nn.Module):
     """
     def __init__(self, num_entities, num_relations, hidden_dim=500, num_bases=None, num_layers=2):
         super().__init__()
+        
+        if not TORCH_GEOMETRIC_AVAILABLE:
+            raise ImportError("torch_geometric is required for R-GCN. Install with: pip install torch-geometric")
 
         self.num_entities = num_entities
         self.num_relations = num_relations
@@ -218,6 +242,8 @@ class RGCNDistMult(nn.Module):
         # R-GCN layers
         self.layers = nn.ModuleList()
         for i in range(num_layers):
+            if RGCNConv is None:
+                raise ImportError("RGCNConv not available. Install torch-geometric.")
             self.layers.append(
                 RGCNConv(hidden_dim, hidden_dim, num_relations, num_bases=num_bases)
             )
@@ -303,6 +329,9 @@ class RGCNInitializer(EmbeddingInitializer):
         return negative_triples
     
     def initialize_embeddings(self, train_df, val_df, test_df, num_entities, num_relations, device, verbose=True):
+        if not TORCH_GEOMETRIC_AVAILABLE:
+            raise ImportError("torch_geometric is required for R-GCN initialization. Install with: pip install torch-geometric")
+        
         if verbose:
             print(f"Training R-GCN embeddings (Paper implementation, {self.epochs} epochs)...")
             print(f"  Entities: {num_entities:,}")
@@ -376,19 +405,6 @@ class RGCNInitializer(EmbeddingInitializer):
     
     def get_name(self):
         return "R-GCN (Paper)"
-
-# =============================================================================
-# EMBEDDING INITIALIZATION METHODS 
-# =============================================================================
-
-class EmbeddingInitializer(ABC):
-    @abstractmethod
-    def initialize_embeddings(self, train_df, val_df, test_df, num_entities, num_relations, device, verbose=True):
-        pass
-    
-    @abstractmethod
-    def get_name(self):
-        pass
 
 class RandomInitializer(EmbeddingInitializer):
     def __init__(self, embed_dim=128):
@@ -631,6 +647,8 @@ def create_embedding_initializer(args):
     """Factory function to create embedding initializer"""
     method = args.embedding_init.lower()
     if method == 'rgcn':
+        if not TORCH_GEOMETRIC_AVAILABLE:
+            raise ImportError("torch_geometric is required for R-GCN initialization. Install with: pip install torch-geometric")
         return RGCNInitializer(args.embed_dim, args.rgcn_epochs, args.rgcn_lr, args.rgcn_layers, args.rgcn_l2_penalty)
     elif method == 'random':
         return RandomInitializer(args.embed_dim)
@@ -698,7 +716,7 @@ def resolve_reward_method(embedding_method, reward_method):
     return reward_method
 
 # =============================================================================
-# UTILITY FUNCTIONS 
+# UTILITY FUNCTIONS (UPDATED WITH YOUR NON-MODULAR METRICS)
 # =============================================================================
 
 def print_progress(message, verbose=True, display_mode='detailed'):
@@ -876,11 +894,15 @@ def print_enhanced_discriminator_metrics(true_labels, pred_probs, epoch, display
     return enhanced_metrics
 
 # =============================================================================
-#  COMPOSITE RL LOSS FUNCTION 
+#  COMPOSITE RL LOSS FUNCTION (FROM YOUR NON-MODULAR CODE)
 # =============================================================================
 
 def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, args, 
                                     true_labels=None, pred_probs=None):
+    """
+    Your exact composite RL loss with discriminator health monitoring and gradual transition
+    """
+    
     device = h_emb.device
     
     if epoch < args.rl_start_epoch:
@@ -1515,7 +1537,7 @@ def main():
     parser.add_argument('--hit_at_k', type=int, nargs='+', default=[1, 5, 10], help='Hit@K values')
     parser.add_argument('--early_stopping_patience', type=int, default=30, help='Early stopping patience')
     
-    # Display and debug options (UPDATED)
+    # Display and debug options
     parser.add_argument('--display_mode', type=str, default='detailed', choices=['simple', 'detailed'],
                         help='Display mode: simple (one-line) or detailed (multi-line)')
     parser.add_argument('--detailed_metrics', action='store_true', default=True, 
