@@ -203,7 +203,7 @@ class Discriminator(nn.Module):
             return scores.cpu().numpy(), probabilities.cpu().numpy()
 
 # =============================================================================
-# EMBEDDING INITIALIZATION METHODS (ABSTRACT BASE CLASS FIRST)
+# EMBEDDING INITIALIZATION METHODS
 # =============================================================================
 
 class EmbeddingInitializer(ABC):
@@ -216,7 +216,7 @@ class EmbeddingInitializer(ABC):
         pass
 
 # =============================================================================
-# EXACT RGCN + DISTMULT IMPLEMENTATION (FROM YOUR STANDALONE CODE)
+# EXACT RGCN + DISTMULT IMPLEMENTATION
 # =============================================================================
 
 class RGCNDistMult(nn.Module):
@@ -389,7 +389,7 @@ class RGCNTrainer:
         self.optimizer.zero_grad()
         total_loss.backward()
 
-        # Gradient clipping 
+        # Gradient clipping (standard practice)
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
         self.optimizer.step()
@@ -427,7 +427,7 @@ class RGCNTrainer:
                     entity_embeddings
                 )
 
-                # Calculate rank 
+                # Calculate rank (no filtering for speed)
                 target_score = all_scores[tail].item()
                 rank = (all_scores > target_score).sum().item() + 1
 
@@ -464,7 +464,7 @@ class RGCNInitializer(EmbeddingInitializer):
             print(f"  L2 penalty: {self.l2_penalty} on decoder")
             print(f"  Learning rate: {self.lr}")
         
-        # Build graph from all data 
+        # Build graph from all data (YOUR EXACT METHOD)
         all_data = pd.concat([train_df, val_df, test_df])
         all_triples = torch.tensor(all_data.values, dtype=torch.long)
         edge_index = all_triples[:, [0, 2]].t().contiguous().to(device)
@@ -475,7 +475,7 @@ class RGCNInitializer(EmbeddingInitializer):
             num_entities=num_entities,
             num_relations=num_relations,
             hidden_dim=self.embed_dim,
-            num_bases=None,  
+            num_bases=None, 
             num_layers=self.layers
         )
 
@@ -538,7 +538,7 @@ class RGCNInitializer(EmbeddingInitializer):
                         best_rel_embeddings = model.relation_embedding.weight.detach().clone()
                     
                     if verbose:
-                        print(f"   New best: Hit@10 {best_val_hit10:.3f}")
+                        print(f"  ✅ New best: Hit@10 {best_val_hit10:.3f}")
                 else:
                     patience_counter += 1
                     if verbose:
@@ -927,7 +927,7 @@ def resolve_reward_method(embedding_method, reward_method):
     return reward_method
 
 # =============================================================================
-# UTILITY FUNCTIONS 
+# UTILITY FUNCTIONS (UPDATED WITH YOUR NON-MODULAR METRICS)
 # =============================================================================
 
 def print_progress(message, verbose=True, display_mode='detailed'):
@@ -1105,7 +1105,7 @@ def print_enhanced_discriminator_metrics(true_labels, pred_probs, epoch, display
     return enhanced_metrics
 
 # =============================================================================
-#  COMPOSITE RL LOSS FUNCTION
+#  COMPOSITE RL LOSS FUNCTION (FROM YOUR NON-MODULAR CODE)
 # =============================================================================
 
 def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, args, 
@@ -1215,13 +1215,13 @@ def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_e
     # 1. Save node embeddings
     node_emb_path = os.path.join(args.data_root, f"{dataset_prefix}_final_node_embeddings.pt")
     torch.save(node_embeddings.cpu(), node_emb_path)
-    print_progress(f"   Node embeddings saved: {node_emb_path}", verbose, args.display_mode)
+    print_progress(f" Node embeddings saved: {node_emb_path}", verbose, args.display_mode)
     
     # 2. Save relation embeddings (as state_dict for consistency)
     rel_emb_path = os.path.join(args.data_root, f"{dataset_prefix}_final_distmult_rel_emb.pt")
     rel_state_dict = {'weight': rel_embeddings.cpu()}
     torch.save(rel_state_dict, rel_emb_path)
-    print_progress(f"   Relation embeddings saved: {rel_emb_path}", verbose, args.display_mode)
+    print_progress(f" Relation embeddings saved: {rel_emb_path}", verbose, args.display_mode)
     
     # 3. Create and save entity mapping
     entity_map_path = os.path.join(args.data_root, f"{dataset_prefix}_entity_map.pkl")
@@ -1232,9 +1232,9 @@ def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_e
         
         with open(entity_map_path, 'wb') as f:
             pickle.dump(entity_map, f)
-        print_progress(f"   Entity mapping saved: {entity_map_path}", verbose, args.display_mode)
+        print_progress(f" Entity mapping saved: {entity_map_path}", verbose, args.display_mode)
     else:
-        print_progress(f"   Entity mapping already exists: {entity_map_path}", verbose, args.display_mode)
+        print_progress(f" Entity mapping already exists: {entity_map_path}", verbose, args.display_mode)
     
     # 4. Create and save relation mapping
     relation_map_path = os.path.join(args.data_root, f"{dataset_prefix}_relation_map.pkl")
@@ -1245,9 +1245,9 @@ def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_e
         
         with open(relation_map_path, 'wb') as f:
             pickle.dump(relation_map, f)
-        print_progress(f"   Relation mapping saved: {relation_map_path}", verbose, args.display_mode)
+        print_progress(f" Relation mapping saved: {relation_map_path}", verbose, args.display_mode)
     else:
-        print_progress(f"   Relation mapping already exists: {relation_map_path}", verbose, args.display_mode)
+        print_progress(f" Relation mapping already exists: {relation_map_path}", verbose, args.display_mode)
     
     # 5. Save reverse mappings for inference
     id_to_entity_path = os.path.join(args.data_root, f"{dataset_prefix}_id_to_entity_map.pkl")
@@ -1259,7 +1259,7 @@ def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_e
         id_to_entity = {idx: entity_id for entity_id, idx in entity_map.items()}
         with open(id_to_entity_path, 'wb') as f:
             pickle.dump(id_to_entity, f)
-        print_progress(f"   Reverse entity mapping saved: {id_to_entity_path}", verbose, args.display_mode)
+        print_progress(f" Reverse entity mapping saved: {id_to_entity_path}", verbose, args.display_mode)
     
     if not os.path.exists(id_to_relation_path):
         with open(relation_map_path, 'rb') as f:
@@ -1267,7 +1267,7 @@ def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_e
         id_to_relation = {idx: rel_id for rel_id, idx in relation_map.items()}
         with open(id_to_relation_path, 'wb') as f:
             pickle.dump(id_to_relation, f)
-        print_progress(f"   Reverse relation mapping saved: {id_to_relation_path}", verbose, args.display_mode)
+        print_progress(f" Reverse relation mapping saved: {id_to_relation_path}", verbose, args.display_mode)
     
     # 6. Save training configuration
     config_path = os.path.join(args.data_root, f"{dataset_prefix}_training_config.json")
@@ -1288,7 +1288,7 @@ def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_e
     
     with open(config_path, 'w') as f:
         json.dump(config_data, f, indent=2)
-    print_progress(f"  ✅ Training config saved: {config_path}", verbose, args.display_mode)
+    print_progress(f" Training config saved: {config_path}", verbose, args.display_mode)
     
     # 7. Save dataset statistics
     stats_path = os.path.join(args.data_root, f"{dataset_prefix}_dataset_stats.json")
@@ -1312,7 +1312,7 @@ def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_e
     
     with open(stats_path, 'w') as f:
         json.dump(stats, f, indent=2)
-    print_progress(f"  Dataset statistics saved: {stats_path}", verbose, args.display_mode)
+    print_progress(f" Dataset statistics saved: {stats_path}", verbose, args.display_mode)
     
     print_progress(f" Initial embeddings and mappings saved successfully!", verbose, args.display_mode)
     print_progress(f"   Files can be reused with: --embedding_init preloaded", verbose, args.display_mode)
@@ -1343,7 +1343,7 @@ def save_phase_checkpoint(phase_name, epoch, generator, discriminator, node_emb,
         checkpoint_data["rel_emb"] = rel_emb.state_dict()
     
     torch.save(checkpoint_data, checkpoint_path)
-    print_progress(f"   {phase_name.title()} checkpoint saved: {checkpoint_path}", verbose, args.display_mode)
+    print_progress(f"  {phase_name.title()} checkpoint saved: {checkpoint_path}", verbose, args.display_mode)
 
 # =============================================================================
 # DATA LOADING
@@ -1409,7 +1409,7 @@ def load_data(args):
     return train_df, val_df, test_df, num_entities, num_relations
 
 # =============================================================================
-# MAIN TRAINING FUNCTION 
+# MAIN TRAINING FUNCTION
 # =============================================================================
 
 def train_modular_prot_b_gan(args):
@@ -1480,10 +1480,10 @@ def train_modular_prot_b_gan(args):
         # STAGE 2.5: DISTMULT WARM-UP
         print_progress(f"STAGE 2.5: DistMult Warm-up (Your Exact Method)", args.verbose, args.display_mode)
         
-        # DistMult warm-up optimizer 
+        # DistMult warm-up optimizer (your exact settings)
         dm_opt = optim.Adam([node_emb, rel_emb.weight], lr=args.distmult_warmup_lr)
         
-        print_progress(f" Starting DistMult warm-up ({args.distmult_warmup_epochs} epochs for proper initialization)...", args.verbose, args.display_mode)
+        print_progress(f"🚀 Starting DistMult warm-up ({args.distmult_warmup_epochs} epochs for proper initialization)...", args.verbose, args.display_mode)
         if device.type == 'cuda':
             print_progress("   GPU acceleration: Expected completion in 2-3 minutes", args.verbose, args.display_mode)
         else:
@@ -1493,7 +1493,7 @@ def train_modular_prot_b_gan(args):
             for batch in train_loader:
                 h_batch, r_batch, t_batch = [b.to(device) for b in batch.T]
 
-                # positive score: batch_size-vector (your exact method)
+                # positive score: batch_size-vector 
                 pos_scores = ( node_emb[h_batch]
                              * rel_emb(r_batch)
                              * node_emb[t_batch]
@@ -1506,7 +1506,7 @@ def train_modular_prot_b_gan(args):
                              * node_emb[neg_t]
                              ).sum(dim=1)
 
-                # margin loss, averaged over the batch 
+                # margin loss, averaged over the batch
                 loss = F.relu(1 + neg_scores - pos_scores).mean()
 
                 dm_opt.zero_grad()
@@ -1517,7 +1517,7 @@ def train_modular_prot_b_gan(args):
                 print_progress(f"   Warm-up epoch {epoch+1}/{args.distmult_warmup_epochs} completed", args.verbose, args.display_mode)
 
         # Start-of-training evaluation (your exact method)
-        warmup_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k) 
+        warmup_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k)  # None = no generator yet
         print_progress(f"Warm-up Hit@1: {warmup_hit_at_k[1]:.4f}, Hit@5: {warmup_hit_at_k[5]:.4f}, Hit@10: {warmup_hit_at_k[10]:.4f}", args.verbose, args.display_mode)
         print_progress("Warm-up evaluation complete.", args.verbose, args.display_mode)
         
@@ -1646,7 +1646,7 @@ def train_modular_prot_b_gan(args):
                     fake_scores = discriminator(h_emb.detach(), r_emb_batch.detach(), fake_samples)
                     
                     neg_indices = generate_balanced_hard_negatives(h_emb.detach(), r_emb_batch.detach(), node_emb,
-                                                                  num_hard=30, num_medium=8, num_easy=7)  
+                                                                  num_hard=30, num_medium=8, num_easy=7)  # Using your values
                     
                     batch_size = h_emb.shape[0]
                     selected_neg_idx = torch.randint(0, neg_indices.shape[1], (batch_size,), device=h_emb.device)
@@ -1666,7 +1666,7 @@ def train_modular_prot_b_gan(args):
                     d_opt.step()
                     total_d_loss += d_loss.item()
                     
-                    # Track discriminator performance
+                    # Track discriminator performance (your metrics)
                     with torch.no_grad():
                         real_preds = (torch.sigmoid(real_scores) > 0.5).float()
                         fake_preds = (torch.sigmoid(torch.cat([fake_scores, hard_neg_scores])) <= 0.5).float()
@@ -1843,10 +1843,10 @@ def train_modular_prot_b_gan(args):
                     }
                 }, checkpoint_path)
             
-            # Progress display
+            # Progress display 
             tier_name = "Pretraining" if epoch <= args.pretrain_epochs else f"Tier {2 if epoch < args.pretrain_epochs + args.full_system_epoch else 3}"
             
-            # Enhanced RL information display
+            # Enhanced RL information display 
             rl_info = ""
             if epoch >= args.rl_start_epoch:
                 if epoch < args.pretrain_epochs + args.full_system_epoch:
@@ -1874,11 +1874,11 @@ def train_modular_prot_b_gan(args):
                     print_progress(f"Collapse: {collapse_score:.3f} | Diversity: {diversity_score:.3f} | Variance: {variance_score:.5f}", 
                                   args.verbose, args.display_mode)
             
-            # Tier transition announcements (your style)
+            # Tier transition announcements
             if epoch == args.rl_start_epoch:
-                print_progress(f"  TIER 2: RL system activated (DistMult only) - Ultra-aggressive temp scaling (÷100)!", args.verbose, args.display_mode)
+                print_progress(f" 🎯 TIER 2: RL system activated (DistMult only) - Ultra-aggressive temp scaling (÷100)!", args.verbose, args.display_mode)
             elif epoch == args.pretrain_epochs + args.full_system_epoch:
-                print_progress(f"  TIER 3: Full composite RL + Adversarial system - Adaptive weights based on discriminator health!", args.verbose, args.display_mode)
+                print_progress(f" 🎯 TIER 3: Full composite RL + Adversarial system - Adaptive weights based on discriminator health!", args.verbose, args.display_mode)
             
             # Early stopping
             if epoch - best_epoch > args.early_stopping_patience:
@@ -1977,7 +1977,7 @@ def train_modular_prot_b_gan(args):
         return None
 
 # =============================================================================
-# COMMAND LINE INTERFACE 
+# COMMAND LINE INTERFACE
 # =============================================================================
 
 def main():
@@ -2093,7 +2093,7 @@ def main():
     results = train_modular_prot_b_gan(args)
     
     if results:
-        print(f"\Training Completed")
+        print(f"\n SUCCESS! Complete Pipeline Training Completed")
         print(f"Best validation Hit@10: {results['best_val_hit10']:.4f}")
         print(f"R-GCN Baseline Test Hit@10: {results['baseline_hit_at_k'][10]:.4f}")
         print(f"Post-Warmup Test Hit@10: {results['warmup_hit_at_k'][10]:.4f}")
