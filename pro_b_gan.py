@@ -729,8 +729,11 @@ def generate_balanced_hard_negatives(h_emb, r_emb, node_emb, num_hard=10, num_me
 #  COMPOSITE RL LOSS FUNCTION 
 # =============================================================================
 
-def compute_your_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, args):
-    """ working RL loss approach with 3-tier progression"""
+def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, args, 
+                                    true_labels=None, pred_probs=None):
+    """
+    IMPROVED:  RL loss with discriminator health monitoring and gradual transition
+    """
     
     device = h_emb.device
     
@@ -738,31 +741,119 @@ def compute_your_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminat
         return torch.tensor(0.0, device=device), {}
     
     elif epoch < args.full_system_epoch:
-        # Tier 2: DistMult only
+        # TIER 2: DistMult-only RL (EXTENDED DURATION)
         dm_scores = (h_emb * r_emb * fake).sum(dim=-1)
-        dm_component = torch.sigmoid(dm_scores / 5.0)
+        # Ultra-aggressive temperature scaling to prevent saturation
+        dm_component = torch.sigmoid(dm_scores / 100.0)  # Prevent saturation
         simple_reward = dm_component - 0.5
         rl_loss = -simple_reward.mean()
         
-        return rl_loss, {'dm_component': dm_component.mean().item()}
+        return rl_loss, {
+            'dm_component': dm_component.mean().item(),
+            'tier': 2,
+            'status': f'Tier 2 - DistMult only (Epoch {epoch}/{args.full_system_epoch})'
+        }
     
     else:
-        # Tier 3: Full composite
+        # TIER 3: Full composite RL with discriminator health monitoring
         dm_scores = (h_emb * r_emb * fake).sum(dim=-1)
-        dm_component = torch.sigmoid(dm_scores / 5.0)
+        dm_component = torch.sigmoid(dm_scores / 100.0)  # Keep ultra-aggressive scaling
         
         with torch.no_grad():
             disc_scores = discriminator(h_emb.detach(), r_emb.detach(), fake.detach())
             disc_component = torch.sigmoid(disc_scores)
         
-        composite_reward = 0.3 * disc_component + 0.7 * dm_component - 0.5
+        # IMPROVED: Discriminator health assessment
+        if true_labels is not None and pred_probs is not None and len(true_labels) > 0:
+            current_disc_f1 = compute_metrics(np.array(true_labels), np.array(pred_probs))['F1']
+        else:
+            current_disc_f1 = 0.3  # Conservative fallback
+        
+        # IMPROVED: Gradual transition based on discriminator health AND epoch
+        epochs_in_tier3 = epoch - args.full_system_epoch + 1
+        
+        if current_disc_f1 < 0.3:  # Discriminator too weak - emergency protection
+            disc_weight = 0.05
+            dm_weight = 0.95
+            status = f"EMERGENCY (F1={current_disc_f1:.3f})"
+        elif current_disc_f1 < 0.45:  # Discriminator weak - heavy protection
+            disc_weight = 0.1 + 0.05 * min(epochs_in_tier3, 10)  # Gradual from 0.1 to 0.6
+            dm_weight = 1.0 - disc_weight
+            status = f"WEAK (F1={current_disc_f1:.3f})"
+        elif current_disc_f1 < 0.55:  # Discriminator learning - moderate protection
+            disc_weight = 0.2 + 0.05 * min(epochs_in_tier3, 8)   # Gradual from 0.2 to 0.6
+            dm_weight = 1.0 - disc_weight
+            status = f"LEARNING (F1={current_disc_f1:.3f})"
+        else:  # Discriminator healthy - balanced training
+            # Gradual transition to balanced 0.5/0.5 over time
+            target_disc_weight = 0.5
+            transition_epochs = 15
+            if epochs_in_tier3 <= transition_epochs:
+                disc_weight = 0.3 + (target_disc_weight - 0.3) * (epochs_in_tier3 / transition_epochs)
+            else:
+                disc_weight = target_disc_weight
+            dm_weight = 1.0 - disc_weight
+            status = f"HEALTHY (F1={current_disc_f1:.3f})"
+        
+        # Ensure weights are reasonable
+        disc_weight = max(0.05, min(0.7, disc_weight))
+        dm_weight = 1.0 - disc_weight
+        
+        composite_reward = disc_weight * disc_component + dm_weight * dm_component - 0.5
         rl_loss = -composite_reward.mean()
         
         return rl_loss, {
             'disc_component': disc_component.mean().item(),
             'dm_component': dm_component.mean().item(),
-            'composite_reward': composite_reward.mean().item()
+            'composite_reward': composite_reward.mean().item(),
+            'disc_weight': disc_weight,
+            'dm_weight': dm_weight,
+            'disc_f1': current_disc_f1,
+            'tier': 3,
+            'status': status,
+            'epochs_in_tier3': epochs_in_tier3
         }
+
+# =============================================================================
+# DISCRIMINATOR READINESS CHECK
+# =============================================================================
+def check_discriminator_readiness(true_labels, pred_probs, min_f1=0.45, min_gap=0.02):
+    """
+    Check if discriminator is ready for full adversarial training
+    
+    Args:
+        true_labels: List of true labels (1 for real, 0 for fake)
+        pred_probs: List of predicted probabilities
+        min_f1: Minimum F1 score required
+        min_gap: Minimum gap between real and fake probabilities
+    
+    Returns:
+        bool: True if discriminator is ready, False otherwise
+    """
+    if not true_labels or not pred_probs:
+        return False
+    
+    try:
+        y_true = np.array(true_labels)
+        y_probs = np.array(pred_probs)
+        
+        # Calculate F1 score
+        metrics = compute_metrics(y_true, y_probs)
+        f1_score = metrics['F1']
+        
+        # Calculate gap between real and fake probabilities
+        real_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 1]
+        fake_probs = [p for i, p in enumerate(y_probs) if y_true[i] == 0]
+        gap = np.mean(real_probs) - np.mean(fake_probs) if real_probs and fake_probs else 0
+        
+        # Check readiness criteria
+        f1_ready = f1_score >= min_f1
+        gap_ready = gap >= min_gap
+        
+        return f1_ready and gap_ready
+        
+    except Exception:
+        return False
 
 def bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb):
     """ bias mitigation approach"""
@@ -1073,7 +1164,11 @@ def train_modular_prot_b_gan(args):
                 loss_components.append(args.distmult_weight * dm_loss)
                 
                 #  RL loss
-                rl_loss, rl_metrics = compute_your_composite_rl_loss(epoch, h_emb, r_emb_batch, fake, t_emb, discriminator, args)
+                rl_loss, rl_metrics = compute_composite_rl_loss(
+                    epoch, h_emb, r_emb_batch, fake, t_emb, discriminator, args,
+                    true_labels=true_labels,  # Pass current batch labels
+                    pred_probs=pred_probs     # Pass current batch probabilities
+                )
                 if rl_loss.item() != 0:
                     loss_components.append(args.rl_weight * rl_loss)
                 
