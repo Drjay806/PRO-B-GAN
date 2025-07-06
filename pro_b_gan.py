@@ -1257,12 +1257,58 @@ def train_modular_prot_b_gan(args):
         baseline_val_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k)
         baseline_test_hit_at_k = evaluate_hit_at_k(test_loader, None, node_emb, rel_emb, device, args.hit_at_k)
         
-        print_progress(f"BASELINE RESULTS ({args.embedding_init.upper()}):", args.verbose, args.display_mode)
+        print_progress(f"BASELINE RESULTS (Post R-GCN + DistMult Warm-up):", args.verbose, args.display_mode)
         print_progress("Train: " + " ".join([f"Hit@{k}: {baseline_train_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
         print_progress("Val:   " + " ".join([f"Hit@{k}: {baseline_val_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
         print_progress("Test:  " + " ".join([f"Hit@{k}: {baseline_test_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
+        print_progress("Post-Warmup Val: " + " ".join([f"Hit@{k}: {warmup_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
         print_progress("=" * 70, args.verbose, args.display_mode)
         
+        # STAGE 2.5: DISTMULT WARM-UP (FROM YOUR NON-MODULAR CODE)
+        print_progress(f"STAGE 2.5: DistMult Warm-up (Your Exact Method)", args.verbose, args.display_mode)
+        
+        # DistMult warm-up optimizer (your exact settings)
+        dm_opt = optim.Adam([node_emb, rel_emb.weight], lr=args.distmult_warmup_lr)
+        
+        print_progress(f"🚀 Starting DistMult warm-up ({args.distmult_warmup_epochs} epochs for proper initialization)...", args.verbose, args.display_mode)
+        if device.type == 'cuda':
+            print_progress("   GPU acceleration: Expected completion in 2-3 minutes", args.verbose, args.display_mode)
+        else:
+            print_progress("   CPU mode: Will take longer, but thorough initialization", args.verbose, args.display_mode)
+
+        for epoch in range(args.distmult_warmup_epochs):  # Configurable epochs
+            for batch in train_loader:
+                h_batch, r_batch, t_batch = [b.to(device) for b in batch.T]
+
+                # positive score: batch_size-vector (your exact method)
+                pos_scores = ( node_emb[h_batch]
+                             * rel_emb(r_batch)
+                             * node_emb[t_batch]
+                             ).sum(dim=1)
+
+                # sample a random tail for each example (your exact method)
+                neg_t = torch.randint(0, node_emb.size(0), t_batch.shape, device=device)
+                neg_scores = ( node_emb[h_batch]
+                             * rel_emb(r_batch)
+                             * node_emb[neg_t]
+                             ).sum(dim=1)
+
+                # margin loss, averaged over the batch (your exact method)
+                loss = F.relu(1 + neg_scores - pos_scores).mean()
+
+                dm_opt.zero_grad()
+                loss.backward()
+                dm_opt.step()
+
+            if epoch % 10 == 0 or epoch == args.distmult_warmup_epochs - 1:
+                print_progress(f"   Warm-up epoch {epoch+1}/{args.distmult_warmup_epochs} completed", args.verbose, args.display_mode)
+
+        # Start-of-training evaluation (your exact method)
+        warmup_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k)  # None = no generator yet
+        print_progress(f"Warm-up Hit@1: {warmup_hit_at_k[1]:.4f}, Hit@5: {warmup_hit_at_k[5]:.4f}, Hit@10: {warmup_hit_at_k[10]:.4f}", args.verbose, args.display_mode)
+        print_progress("Warm-up evaluation complete.", args.verbose, args.display_mode)
+        print_progress("=" * 70, args.verbose, args.display_mode)
+
         # Initialize models
         print_progress(f"STAGE 2: Model Architecture Setup", args.verbose, args.display_mode)
         
@@ -1280,10 +1326,12 @@ def train_modular_prot_b_gan(args):
         best_epoch = 0
         
         # Training schedule
-        print_progress(f"STAGE 3: Tiered Training System", args.verbose, args.display_mode)
-        print_progress(f"  Tier 1 (Epochs 1-{args.pretrain_epochs}): Pretraining", args.verbose, args.display_mode)
-        print_progress(f"  Tier 2 (Epochs +{args.rl_start_epoch}): + RL (DistMult)", args.verbose, args.display_mode)
-        print_progress(f"  Tier 3 (Epochs +{args.full_system_epoch}): + Full Adversarial", args.verbose, args.display_mode)
+        print_progress(f"STAGE 3: Complete Training Pipeline (Your Exact Method)", args.verbose, args.display_mode)
+        print_progress(f"  Phase 1: R-GCN + DistMult Initialization", args.verbose, args.display_mode)
+        print_progress(f"  Phase 2: DistMult Warm-up ({args.distmult_warmup_epochs} epochs)", args.verbose, args.display_mode)
+        print_progress(f"  Phase 3: Pretraining (Epochs 1-{args.pretrain_epochs})", args.verbose, args.display_mode)
+        print_progress(f"  Phase 4: Tier 2 - RL System (Epoch {args.rl_start_epoch}+)", args.verbose, args.display_mode)
+        print_progress(f"  Phase 5: Tier 3 - Full Adversarial (Epoch {args.full_system_epoch}+)", args.verbose, args.display_mode)
         
         # Training history (from your non-modular code)
         training_history = {
@@ -1535,7 +1583,8 @@ def train_modular_prot_b_gan(args):
                     "baseline_results": {
                         "train": baseline_train_hit_at_k,
                         "val": baseline_val_hit_at_k,
-                        "test": baseline_test_hit_at_k
+                        "test": baseline_test_hit_at_k,
+                        "post_warmup_val": warmup_hit_at_k
                     }
                 }, checkpoint_path)
             
@@ -1593,10 +1642,15 @@ def train_modular_prot_b_gan(args):
         for k in args.hit_at_k:
             print_progress(f"Test Hit@{k}: {test_hit_at_k[k]:.4f} ({test_hit_at_k[k]*100:.1f}%)", args.verbose, args.display_mode)
         
-        print_progress(f"\nIMPROVEMENT OVER BASELINE:", args.verbose, args.display_mode)
+        print_progress(f"IMPROVEMENT OVER BASELINES:", args.verbose, args.display_mode)
+        print_progress(f"Over R-GCN Init:", args.verbose, args.display_mode)
         for k in args.hit_at_k:
             improvement = test_hit_at_k[k] - baseline_test_hit_at_k[k]
-            print_progress(f"Hit@{k}: {improvement:+.4f} ({improvement*100:+.1f}%)", args.verbose, args.display_mode)
+            print_progress(f"  Hit@{k}: {improvement:+.4f} ({improvement*100:+.1f}%)", args.verbose, args.display_mode)
+        print_progress(f"Over Post-Warmup:", args.verbose, args.display_mode)
+        for k in args.hit_at_k:
+            improvement = test_hit_at_k[k] - warmup_hit_at_k[k]
+            print_progress(f"  Hit@{k}: {improvement:+.4f} ({improvement*100:+.1f}%)", args.verbose, args.display_mode)
         
         if args.display_mode == 'detailed':
             print_progress(f"\nDISCRIMINATOR FINAL HEALTH:", args.verbose, args.display_mode)
@@ -1612,6 +1666,7 @@ def train_modular_prot_b_gan(args):
             "rel_emb": rel_emb,
             "test_hit_at_k": test_hit_at_k,
             "baseline_hit_at_k": baseline_test_hit_at_k,
+            "warmup_hit_at_k": warmup_hit_at_k,
             "best_val_hit10": best_val_hit10,
             "training_history": training_history,
             "device": device
@@ -1677,6 +1732,10 @@ def main():
     parser.add_argument('--complex_lr', type=float, default=0.01, help='ComplEx learning rate')
     parser.add_argument('--complex_regularization', type=float, default=0.01, help='ComplEx L2 regularization')
     
+    # DistMult warm-up specific
+    parser.add_argument('--distmult_warmup_epochs', type=int, default=50, help='DistMult warm-up epochs')
+    parser.add_argument('--distmult_warmup_lr', type=float, default=1e-2, help='DistMult warm-up learning rate')
+    
     # Tiered training schedule
     parser.add_argument('--pretrain_epochs', type=int, default=90, help='Pretraining epochs')
     parser.add_argument('--rl_start_epoch', type=int, default=20, help='RL start epoch (Tier 2)')
@@ -1729,11 +1788,12 @@ def main():
     results = train_modular_prot_b_gan(args)
     
     if results:
-        print(f"\nSUCCESS! Training completed")
+        print(f"\nSUCCESS! Complete Pipeline Training Completed")
         print(f"Best validation Hit@10: {results['best_val_hit10']:.4f}")
-        print(f"Baseline Test Hit@10: {results['baseline_hit_at_k'][10]:.4f}")
+        print(f"R-GCN Baseline Test Hit@10: {results['baseline_hit_at_k'][10]:.4f}")
+        print(f"Post-Warmup Test Hit@10: {results['warmup_hit_at_k'][10]:.4f}")
         print(f"Final Test Hit@10: {results['test_hit_at_k'][10]:.4f}")
-        print(f"Improvement: {results['test_hit_at_k'][10] - results['baseline_hit_at_k'][10]:+.4f}")
+        print(f"Total Improvement: {results['test_hit_at_k'][10] - results['baseline_hit_at_k'][10]:+.4f}")
         print(f"Models saved to: {args.output_dir}")
         return 0
     else:
