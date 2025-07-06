@@ -8,6 +8,7 @@ Prot-B-GAN
 - generator/discriminator for inference
 - Full parameter configuration
 - Simple vs detailed display options
+- Complete saving system for reproducibility
 
 Usage:
     python modular_prot_b_gan.py \
@@ -27,6 +28,8 @@ import torch.optim as optim
 import pandas as pd
 import pickle
 import argparse
+import json
+import time
 try:
     from torch_geometric.nn import RGCNConv
     TORCH_GEOMETRIC_AVAILABLE = True
@@ -42,7 +45,6 @@ from sklearn.metrics import f1_score, average_precision_score, matthews_corrcoef
 from sklearn.decomposition import PCA
 import numpy as np
 from collections import deque, defaultdict
-import time
 import random
 from tqdm import tqdm
 from abc import ABC, abstractmethod
@@ -387,7 +389,7 @@ class RGCNTrainer:
         self.optimizer.zero_grad()
         total_loss.backward()
 
-        # Gradient clipping (standard practice)
+        # Gradient clipping 
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
         self.optimizer.step()
@@ -425,7 +427,7 @@ class RGCNTrainer:
                     entity_embeddings
                 )
 
-                # Calculate rank (no filtering for speed)
+                # Calculate rank 
                 target_score = all_scores[tail].item()
                 rank = (all_scores > target_score).sum().item() + 1
 
@@ -442,7 +444,7 @@ class RGCNTrainer:
         return hit_ratios
 
 class RGCNInitializer(EmbeddingInitializer):
-    def __init__(self, embed_dim=128, epochs=100, lr=0.01, layers=2, l2_penalty=0.01, early_stopping_patience=15):
+    def __init__(self, embed_dim=128, epochs=100, lr=0.01, layers=2, l2_penalty=0.01, early_stopping_patience=50):
         self.embed_dim = embed_dim
         self.epochs = epochs
         self.lr = lr
@@ -462,7 +464,7 @@ class RGCNInitializer(EmbeddingInitializer):
             print(f"  L2 penalty: {self.l2_penalty} on decoder")
             print(f"  Learning rate: {self.lr}")
         
-        # Build graph from all data (YOUR EXACT METHOD)
+        # Build graph from all data 
         all_data = pd.concat([train_df, val_df, test_df])
         all_triples = torch.tensor(all_data.values, dtype=torch.long)
         edge_index = all_triples[:, [0, 2]].t().contiguous().to(device)
@@ -473,7 +475,7 @@ class RGCNInitializer(EmbeddingInitializer):
             num_entities=num_entities,
             num_relations=num_relations,
             hidden_dim=self.embed_dim,
-            num_bases=None,  # Will be set automatically like in your code
+            num_bases=None,  
             num_layers=self.layers
         )
 
@@ -536,7 +538,7 @@ class RGCNInitializer(EmbeddingInitializer):
                         best_rel_embeddings = model.relation_embedding.weight.detach().clone()
                     
                     if verbose:
-                        print(f"  ✅ New best: Hit@10 {best_val_hit10:.3f}")
+                        print(f"   New best: Hit@10 {best_val_hit10:.3f}")
                 else:
                     patience_counter += 1
                     if verbose:
@@ -544,7 +546,7 @@ class RGCNInitializer(EmbeddingInitializer):
 
                 if patience_counter >= self.early_stopping_patience:
                     if verbose:
-                        print(f"\n🛑 Early stopping triggered after {self.early_stopping_patience} epochs without improvement")
+                        print(f"\n Early stopping triggered after {self.early_stopping_patience} epochs without improvement")
                         print(f"Best validation Hit@10: {best_val_hit10:.3f}")
                     break
 
@@ -807,6 +809,49 @@ class ComplExInitializer(EmbeddingInitializer):
     def get_name(self):
         return "ComplEx"
 
+class PreloadedInitializer(EmbeddingInitializer):
+    """Load pre-saved embeddings"""
+    
+    def __init__(self, embed_dim=128, data_root=None):
+        self.embed_dim = embed_dim
+        self.data_root = data_root
+    
+    def initialize_embeddings(self, train_df, val_df, test_df, num_entities, num_relations, device, verbose=True):
+        if verbose:
+            print(f"Loading pre-saved embeddings from {self.data_root}...")
+        
+        # Auto-detect dataset name
+        dataset_name = os.path.basename(self.data_root.rstrip('/'))
+        if 'FB15k' in dataset_name or 'fb15k' in dataset_name:
+            dataset_prefix = "FB15k-237"
+        elif 'prothgt' in dataset_name.lower():
+            dataset_prefix = "prothgt"
+        else:
+            dataset_prefix = dataset_name
+        
+        node_emb_path = os.path.join(self.data_root, f"{dataset_prefix}_final_node_embeddings.pt")
+        rel_emb_path = os.path.join(self.data_root, f"{dataset_prefix}_final_distmult_rel_emb.pt")
+        
+        if not os.path.exists(node_emb_path):
+            raise FileNotFoundError(f"Node embeddings not found: {node_emb_path}")
+        if not os.path.exists(rel_emb_path):
+            raise FileNotFoundError(f"Relation embeddings not found: {rel_emb_path}")
+        
+        # Load embeddings
+        node_embeddings = torch.load(node_emb_path, map_location=device)
+        
+        # Load relation embeddings (they're saved as state_dict)
+        rel_state_dict = torch.load(rel_emb_path, map_location=device)
+        relation_embeddings = rel_state_dict['weight']
+        
+        if verbose:
+            print(f"Loaded embeddings: {node_embeddings.shape} nodes, {relation_embeddings.shape} relations")
+        
+        return node_embeddings, relation_embeddings
+    
+    def get_name(self):
+        return "Preloaded"
+
 def create_embedding_initializer(args):
     """Factory function to create embedding initializer"""
     method = args.embedding_init.lower()
@@ -814,6 +859,8 @@ def create_embedding_initializer(args):
         if not TORCH_GEOMETRIC_AVAILABLE:
             raise ImportError("torch_geometric is required for R-GCN initialization. Install with: pip install torch-geometric")
         return RGCNInitializer(args.embed_dim, args.rgcn_epochs, args.rgcn_lr, args.rgcn_layers, args.rgcn_l2_penalty, args.rgcn_early_stopping_patience)
+    elif method == 'preloaded':
+        return PreloadedInitializer(args.embed_dim, args.data_root)
     elif method == 'random':
         return RandomInitializer(args.embed_dim)
     elif method == 'transe':
@@ -880,7 +927,7 @@ def resolve_reward_method(embedding_method, reward_method):
     return reward_method
 
 # =============================================================================
-# UTILITY FUNCTIONS (UPDATED WITH YOUR NON-MODULAR METRICS)
+# UTILITY FUNCTIONS 
 # =============================================================================
 
 def print_progress(message, verbose=True, display_mode='detailed'):
@@ -1058,7 +1105,7 @@ def print_enhanced_discriminator_metrics(true_labels, pred_probs, epoch, display
     return enhanced_metrics
 
 # =============================================================================
-#  COMPOSITE RL LOSS FUNCTION (FROM YOUR NON-MODULAR CODE)
+#  COMPOSITE RL LOSS FUNCTION
 # =============================================================================
 
 def compute_composite_rl_loss(epoch, h_emb, r_emb, fake, t_emb, discriminator, args, 
@@ -1148,6 +1195,157 @@ def bias_mitigation_loss(fake, t_emb, node_emb, h_emb, r_emb):
     return margin_loss + 0.1 * diversity_loss
 
 # =============================================================================
+# COMPREHENSIVE SAVING FUNCTIONS
+# =============================================================================
+
+def save_initial_embeddings_and_mappings(args, train_df, val_df, test_df, node_embeddings, rel_embeddings, num_entities, num_relations, verbose=True):
+    """Save initial embeddings and all necessary mappings for reusability"""
+    
+    # Auto-detect dataset prefix
+    dataset_name = os.path.basename(args.data_root.rstrip('/'))
+    if 'FB15k' in dataset_name or 'fb15k' in dataset_name:
+        dataset_prefix = "FB15k-237"
+    elif 'prothgt' in dataset_name.lower():
+        dataset_prefix = "prothgt"
+    else:
+        dataset_prefix = dataset_name
+    
+    print_progress(f"Saving initial embeddings and mappings for reuse...", verbose, args.display_mode)
+    
+    # 1. Save node embeddings
+    node_emb_path = os.path.join(args.data_root, f"{dataset_prefix}_final_node_embeddings.pt")
+    torch.save(node_embeddings.cpu(), node_emb_path)
+    print_progress(f"   Node embeddings saved: {node_emb_path}", verbose, args.display_mode)
+    
+    # 2. Save relation embeddings (as state_dict for consistency)
+    rel_emb_path = os.path.join(args.data_root, f"{dataset_prefix}_final_distmult_rel_emb.pt")
+    rel_state_dict = {'weight': rel_embeddings.cpu()}
+    torch.save(rel_state_dict, rel_emb_path)
+    print_progress(f"   Relation embeddings saved: {rel_emb_path}", verbose, args.display_mode)
+    
+    # 3. Create and save entity mapping
+    entity_map_path = os.path.join(args.data_root, f"{dataset_prefix}_entity_map.pkl")
+    if not os.path.exists(entity_map_path):
+        all_data = pd.concat([train_df, val_df, test_df])
+        all_entities = sorted(set(all_data['H'].unique()) | set(all_data['T'].unique()))
+        entity_map = {entity_id: idx for idx, entity_id in enumerate(all_entities)}
+        
+        with open(entity_map_path, 'wb') as f:
+            pickle.dump(entity_map, f)
+        print_progress(f"   Entity mapping saved: {entity_map_path}", verbose, args.display_mode)
+    else:
+        print_progress(f"   Entity mapping already exists: {entity_map_path}", verbose, args.display_mode)
+    
+    # 4. Create and save relation mapping
+    relation_map_path = os.path.join(args.data_root, f"{dataset_prefix}_relation_map.pkl")
+    if not os.path.exists(relation_map_path):
+        all_data = pd.concat([train_df, val_df, test_df])
+        unique_relations = sorted(all_data['R'].unique())
+        relation_map = {rel_id: idx for idx, rel_id in enumerate(unique_relations)}
+        
+        with open(relation_map_path, 'wb') as f:
+            pickle.dump(relation_map, f)
+        print_progress(f"   Relation mapping saved: {relation_map_path}", verbose, args.display_mode)
+    else:
+        print_progress(f"   Relation mapping already exists: {relation_map_path}", verbose, args.display_mode)
+    
+    # 5. Save reverse mappings for inference
+    id_to_entity_path = os.path.join(args.data_root, f"{dataset_prefix}_id_to_entity_map.pkl")
+    id_to_relation_path = os.path.join(args.data_root, f"{dataset_prefix}_id_to_relation_map.pkl")
+    
+    if not os.path.exists(id_to_entity_path):
+        with open(entity_map_path, 'rb') as f:
+            entity_map = pickle.load(f)
+        id_to_entity = {idx: entity_id for entity_id, idx in entity_map.items()}
+        with open(id_to_entity_path, 'wb') as f:
+            pickle.dump(id_to_entity, f)
+        print_progress(f"   Reverse entity mapping saved: {id_to_entity_path}", verbose, args.display_mode)
+    
+    if not os.path.exists(id_to_relation_path):
+        with open(relation_map_path, 'rb') as f:
+            relation_map = pickle.load(f)
+        id_to_relation = {idx: rel_id for rel_id, idx in relation_map.items()}
+        with open(id_to_relation_path, 'wb') as f:
+            pickle.dump(id_to_relation, f)
+        print_progress(f"   Reverse relation mapping saved: {id_to_relation_path}", verbose, args.display_mode)
+    
+    # 6. Save training configuration
+    config_path = os.path.join(args.data_root, f"{dataset_prefix}_training_config.json")
+    config_data = {
+        'args': vars(args),
+        'dataset_info': {
+            'num_entities': num_entities,
+            'num_relations': num_relations,
+            'train_size': len(train_df),
+            'val_size': len(val_df),
+            'test_size': len(test_df)
+        },
+        'embedding_method': args.embedding_init,
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'torch_version': torch.__version__,
+        'device': str(torch.cuda.get_device_name() if torch.cuda.is_available() else 'cpu')
+    }
+    
+    with open(config_path, 'w') as f:
+        json.dump(config_data, f, indent=2)
+    print_progress(f"  ✅ Training config saved: {config_path}", verbose, args.display_mode)
+    
+    # 7. Save dataset statistics
+    stats_path = os.path.join(args.data_root, f"{dataset_prefix}_dataset_stats.json")
+    all_data = pd.concat([train_df, val_df, test_df])
+    stats = {
+        'entity_count': num_entities,
+        'relation_count': num_relations,
+        'split_sizes': {
+            'train': len(train_df),
+            'val': len(val_df), 
+            'test': len(test_df)
+        },
+        'relation_frequency': dict(all_data['R'].value_counts().head(20)),
+        'entity_frequency_head': dict(all_data['H'].value_counts().head(20)),
+        'entity_frequency_tail': dict(all_data['T'].value_counts().head(20)),
+        'avg_degree': {
+            'in_degree': float(all_data['T'].value_counts().mean()),
+            'out_degree': float(all_data['H'].value_counts().mean())
+        }
+    }
+    
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+    print_progress(f"  Dataset statistics saved: {stats_path}", verbose, args.display_mode)
+    
+    print_progress(f" Initial embeddings and mappings saved successfully!", verbose, args.display_mode)
+    print_progress(f"   Files can be reused with: --embedding_init preloaded", verbose, args.display_mode)
+    
+    return dataset_prefix
+
+def save_phase_checkpoint(phase_name, epoch, generator, discriminator, node_emb, rel_emb, additional_data, args, dataset_prefix, verbose=True):
+    """Save checkpoint for specific training phase"""
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    checkpoint_path = os.path.join(args.output_dir, f"{dataset_prefix}_{phase_name}_checkpoint.pt")
+    
+    checkpoint_data = {
+        "phase": phase_name,
+        "epoch": epoch,
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+        **additional_data
+    }
+    
+    # Add model states if available
+    if generator is not None:
+        checkpoint_data["generator"] = generator.state_dict()
+    if discriminator is not None:
+        checkpoint_data["discriminator"] = discriminator.state_dict()
+    if node_emb is not None:
+        checkpoint_data["node_emb"] = node_emb.detach().cpu()
+    if rel_emb is not None:
+        checkpoint_data["rel_emb"] = rel_emb.state_dict()
+    
+    torch.save(checkpoint_data, checkpoint_path)
+    print_progress(f"   {phase_name.title()} checkpoint saved: {checkpoint_path}", verbose, args.display_mode)
+
+# =============================================================================
 # DATA LOADING
 # =============================================================================
 
@@ -1211,11 +1409,11 @@ def load_data(args):
     return train_df, val_df, test_df, num_entities, num_relations
 
 # =============================================================================
-# MAIN TRAINING FUNCTION (UPDATED WITH YOUR METRICS)
+# MAIN TRAINING FUNCTION 
 # =============================================================================
 
 def train_modular_prot_b_gan(args):
-    """Main training function with tiered system made modular and your metrics"""
+    """Main training function with tiered system and complete saving system"""
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print_progress(f"Modular Prot-B-GAN Training", args.verbose, args.display_mode)
@@ -1250,6 +1448,12 @@ def train_modular_prot_b_gan(args):
         
         print_progress(f"Embeddings ready: Nodes {node_emb.shape}, Relations {rel_emb.weight.shape}", args.verbose, args.display_mode)
         
+        # SAVE INITIAL EMBEDDINGS AND MAPPINGS
+        dataset_prefix = save_initial_embeddings_and_mappings(
+            args, train_df, val_df, test_df, node_embeddings, rel_embeddings, 
+            num_entities, num_relations, args.verbose
+        )
+        
         # BASELINE EVALUATION AFTER EMBEDDING INITIALIZATION
         print_progress(f"\nSTAGE 1.5: Baseline Evaluation (Post-Embedding)", args.verbose, args.display_mode)
         
@@ -1257,20 +1461,29 @@ def train_modular_prot_b_gan(args):
         baseline_val_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k)
         baseline_test_hit_at_k = evaluate_hit_at_k(test_loader, None, node_emb, rel_emb, device, args.hit_at_k)
         
-        print_progress(f"BASELINE RESULTS (Post R-GCN + DistMult Warm-up):", args.verbose, args.display_mode)
+        print_progress(f"BASELINE RESULTS (Post R-GCN + DistMult Initialization):", args.verbose, args.display_mode)
         print_progress("Train: " + " ".join([f"Hit@{k}: {baseline_train_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
         print_progress("Val:   " + " ".join([f"Hit@{k}: {baseline_val_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
         print_progress("Test:  " + " ".join([f"Hit@{k}: {baseline_test_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
-        print_progress("Post-Warmup Val: " + " ".join([f"Hit@{k}: {warmup_hit_at_k[k]:.4f}" for k in args.hit_at_k]), args.verbose, args.display_mode)
         print_progress("=" * 70, args.verbose, args.display_mode)
         
-        # STAGE 2.5: DISTMULT WARM-UP (FROM YOUR NON-MODULAR CODE)
+        # SAVE R-GCN CHECKPOINT
+        save_phase_checkpoint("rgcn", 0, None, None, node_emb, rel_emb, {
+            "baseline_results": {
+                "train": baseline_train_hit_at_k,
+                "val": baseline_val_hit_at_k,
+                "test": baseline_test_hit_at_k
+            },
+            "config": vars(args)
+        }, args, dataset_prefix, args.verbose)
+        
+        # STAGE 2.5: DISTMULT WARM-UP
         print_progress(f"STAGE 2.5: DistMult Warm-up (Your Exact Method)", args.verbose, args.display_mode)
         
-        # DistMult warm-up optimizer (your exact settings)
+        # DistMult warm-up optimizer 
         dm_opt = optim.Adam([node_emb, rel_emb.weight], lr=args.distmult_warmup_lr)
         
-        print_progress(f"🚀 Starting DistMult warm-up ({args.distmult_warmup_epochs} epochs for proper initialization)...", args.verbose, args.display_mode)
+        print_progress(f" Starting DistMult warm-up ({args.distmult_warmup_epochs} epochs for proper initialization)...", args.verbose, args.display_mode)
         if device.type == 'cuda':
             print_progress("   GPU acceleration: Expected completion in 2-3 minutes", args.verbose, args.display_mode)
         else:
@@ -1286,14 +1499,14 @@ def train_modular_prot_b_gan(args):
                              * node_emb[t_batch]
                              ).sum(dim=1)
 
-                # sample a random tail for each example (your exact method)
+                # sample a random tail for each example 
                 neg_t = torch.randint(0, node_emb.size(0), t_batch.shape, device=device)
                 neg_scores = ( node_emb[h_batch]
                              * rel_emb(r_batch)
                              * node_emb[neg_t]
                              ).sum(dim=1)
 
-                # margin loss, averaged over the batch (your exact method)
+                # margin loss, averaged over the batch 
                 loss = F.relu(1 + neg_scores - pos_scores).mean()
 
                 dm_opt.zero_grad()
@@ -1304,9 +1517,15 @@ def train_modular_prot_b_gan(args):
                 print_progress(f"   Warm-up epoch {epoch+1}/{args.distmult_warmup_epochs} completed", args.verbose, args.display_mode)
 
         # Start-of-training evaluation (your exact method)
-        warmup_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k)  # None = no generator yet
+        warmup_hit_at_k = evaluate_hit_at_k(val_loader, None, node_emb, rel_emb, device, args.hit_at_k) 
         print_progress(f"Warm-up Hit@1: {warmup_hit_at_k[1]:.4f}, Hit@5: {warmup_hit_at_k[5]:.4f}, Hit@10: {warmup_hit_at_k[10]:.4f}", args.verbose, args.display_mode)
         print_progress("Warm-up evaluation complete.", args.verbose, args.display_mode)
+        
+        # SAVE WARMUP CHECKPOINT
+        save_phase_checkpoint("warmup", args.distmult_warmup_epochs, None, None, node_emb, rel_emb, {
+            "warmup_results": warmup_hit_at_k
+        }, args, dataset_prefix, args.verbose)
+        
         print_progress("=" * 70, args.verbose, args.display_mode)
 
         # Initialize models
@@ -1387,6 +1606,13 @@ def train_modular_prot_b_gan(args):
                     print_progress(f"Epoch {epoch}/{args.epochs} [Pretraining]", args.verbose, args.display_mode)
                 else:
                     print_progress(f"[Pretraining] Epoch {epoch}: Basic generator training", args.verbose, args.display_mode)
+                
+                # SAVE PRETRAINING CHECKPOINT (at the end of pretraining)
+                if epoch == args.pretrain_epochs:
+                    save_phase_checkpoint("pretrain", epoch, generator, discriminator, node_emb, rel_emb, {
+                        "training_history": training_history
+                    }, args, dataset_prefix, args.verbose)
+                
                 continue
             
             # ADVANCED TRAINING (Tiers 2 & 3)
@@ -1420,7 +1646,7 @@ def train_modular_prot_b_gan(args):
                     fake_scores = discriminator(h_emb.detach(), r_emb_batch.detach(), fake_samples)
                     
                     neg_indices = generate_balanced_hard_negatives(h_emb.detach(), r_emb_batch.detach(), node_emb,
-                                                                  num_hard=30, num_medium=8, num_easy=7)  # Using your values
+                                                                  num_hard=30, num_medium=8, num_easy=7)  
                     
                     batch_size = h_emb.shape[0]
                     selected_neg_idx = torch.randint(0, neg_indices.shape[1], (batch_size,), device=h_emb.device)
@@ -1440,7 +1666,7 @@ def train_modular_prot_b_gan(args):
                     d_opt.step()
                     total_d_loss += d_loss.item()
                     
-                    # Track discriminator performance (your metrics)
+                    # Track discriminator performance
                     with torch.no_grad():
                         real_preds = (torch.sigmoid(real_scores) > 0.5).float()
                         fake_preds = (torch.sigmoid(torch.cat([fake_scores, hard_neg_scores])) <= 0.5).float()
@@ -1567,10 +1793,11 @@ def train_modular_prot_b_gan(args):
                 best_val_hit10 = val_hit_at_k[10]
                 best_epoch = epoch
                 
-                # Save checkpoint
+                # ENHANCED FINAL CHECKPOINT SAVE
                 os.makedirs(args.output_dir, exist_ok=True)
                 checkpoint_path = os.path.join(args.output_dir, "best_checkpoint.pt")
                 torch.save({
+                    "phase": "training_complete",
                     "generator": generator.state_dict(),
                     "discriminator": discriminator.state_dict(),
                     "node_emb": node_emb.detach().cpu(),
@@ -1578,20 +1805,48 @@ def train_modular_prot_b_gan(args):
                     "epoch": epoch,
                     "best_val_hit10": best_val_hit10,
                     "best_epoch": best_epoch,
+                    
+                    # Full configuration
                     "args": vars(args),
+                    "model_config": {
+                        "generator_params": sum(p.numel() for p in generator.parameters()),
+                        "discriminator_params": sum(p.numel() for p in discriminator.parameters()),
+                        "embedding_dims": {
+                            "nodes": tuple(node_emb.shape),
+                            "relations": tuple(rel_emb.weight.shape)
+                        }
+                    },
+                    
+                    # Complete training history
                     "training_history": training_history,
+                    
+                    # All baseline results
                     "baseline_results": {
-                        "train": baseline_train_hit_at_k,
-                        "val": baseline_val_hit_at_k,
-                        "test": baseline_test_hit_at_k,
-                        "post_warmup_val": warmup_hit_at_k
+                        "rgcn_init": {"train": baseline_train_hit_at_k, "val": baseline_val_hit_at_k, "test": baseline_test_hit_at_k},
+                        "post_warmup": {"val": warmup_hit_at_k}
+                    },
+                    
+                    # Current results
+                    "current_results": {
+                        "train_hit_at_k": train_hit_at_k,
+                        "val_hit_at_k": val_hit_at_k,
+                        "val_metrics": val_metrics
+                    },
+                    
+                    # Reproducibility info
+                    "reproducibility": {
+                        "torch_version": torch.__version__,
+                        "torch_geometric_available": TORCH_GEOMETRIC_AVAILABLE,
+                        "device": str(device),
+                        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+                        "dataset_prefix": dataset_prefix
                     }
                 }, checkpoint_path)
             
-            # Progress display (your style)
+            # Progress display
             tier_name = "Pretraining" if epoch <= args.pretrain_epochs else f"Tier {2 if epoch < args.pretrain_epochs + args.full_system_epoch else 3}"
             
-            # Enhanced RL information display (your style)
+            # Enhanced RL information display
             rl_info = ""
             if epoch >= args.rl_start_epoch:
                 if epoch < args.pretrain_epochs + args.full_system_epoch:
@@ -1621,9 +1876,9 @@ def train_modular_prot_b_gan(args):
             
             # Tier transition announcements (your style)
             if epoch == args.rl_start_epoch:
-                print_progress(f" 🎯 TIER 2: RL system activated (DistMult only) - Ultra-aggressive temp scaling (÷100)!", args.verbose, args.display_mode)
+                print_progress(f"  TIER 2: RL system activated (DistMult only) - Ultra-aggressive temp scaling (÷100)!", args.verbose, args.display_mode)
             elif epoch == args.pretrain_epochs + args.full_system_epoch:
-                print_progress(f" 🎯 TIER 3: Full composite RL + Adversarial system - Adaptive weights based on discriminator health!", args.verbose, args.display_mode)
+                print_progress(f"  TIER 3: Full composite RL + Adversarial system - Adaptive weights based on discriminator health!", args.verbose, args.display_mode)
             
             # Early stopping
             if epoch - best_epoch > args.early_stopping_patience:
@@ -1658,6 +1913,48 @@ def train_modular_prot_b_gan(args):
             print_progress(f"   AUPR:     {final_val_metrics['AUPR']:.3f}", args.verbose, args.display_mode)
             print_progress(f"   AUC:      {final_val_metrics['AUC']:.3f}", args.verbose, args.display_mode)
         
+        # Final comprehensive checkpoint save
+        final_checkpoint_path = os.path.join(args.output_dir, "final_complete_checkpoint.pt")
+        torch.save({
+            "phase": "final_complete",
+            "generator": generator.state_dict(),
+            "discriminator": discriminator.state_dict(),
+            "node_emb": node_emb.detach().cpu(),
+            "rel_emb": rel_emb.state_dict(),
+            "epoch": epoch,
+            "best_val_hit10": best_val_hit10,
+            "best_epoch": best_epoch,
+            "args": vars(args),
+            "training_history": training_history,
+            "final_results": {
+                "test_hit_at_k": test_hit_at_k,
+                "final_val_metrics": final_val_metrics
+            },
+            "all_baselines": {
+                "rgcn_init": {"train": baseline_train_hit_at_k, "val": baseline_val_hit_at_k, "test": baseline_test_hit_at_k},
+                "post_warmup": {"val": warmup_hit_at_k}
+            },
+            "reproducibility": {
+                "torch_version": torch.__version__,
+                "device": str(device),
+                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+                "dataset_prefix": dataset_prefix
+            }
+        }, final_checkpoint_path)
+        
+        print_progress(f"\n SAVED FILES SUMMARY:", args.verbose, args.display_mode)
+        print_progress(f"Initial Embeddings (Reusable):", args.verbose, args.display_mode)
+        print_progress(f"  • {dataset_prefix}_final_node_embeddings.pt", args.verbose, args.display_mode)
+        print_progress(f"  • {dataset_prefix}_final_distmult_rel_emb.pt", args.verbose, args.display_mode)
+        print_progress(f"  • {dataset_prefix}_*_map.pkl files (4 files)", args.verbose, args.display_mode)
+        print_progress(f"Phase Checkpoints:", args.verbose, args.display_mode)
+        print_progress(f"  • {dataset_prefix}_rgcn_checkpoint.pt", args.verbose, args.display_mode)
+        print_progress(f"  • {dataset_prefix}_warmup_checkpoint.pt", args.verbose, args.display_mode)
+        print_progress(f"  • {dataset_prefix}_pretrain_checkpoint.pt", args.verbose, args.display_mode)
+        print_progress(f"Final Models:", args.verbose, args.display_mode)
+        print_progress(f"  • best_checkpoint.pt (best validation)", args.verbose, args.display_mode)
+        print_progress(f"  • final_complete_checkpoint.pt (complete final)", args.verbose, args.display_mode)
+        
         # Return results for inference
         return {
             "generator": generator,
@@ -1669,19 +1966,22 @@ def train_modular_prot_b_gan(args):
             "warmup_hit_at_k": warmup_hit_at_k,
             "best_val_hit10": best_val_hit10,
             "training_history": training_history,
-            "device": device
+            "device": device,
+            "dataset_prefix": dataset_prefix
         }
         
     except Exception as e:
         print_progress(f"Training failed: {e}", args.verbose, args.display_mode)
+        import traceback
+        traceback.print_exc()
         return None
 
 # =============================================================================
-# COMMAND LINE INTERFACE (UPDATED WITH NEW PARAMETERS)
+# COMMAND LINE INTERFACE 
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Modular Prot-B-GAN with Tiered Training System')
+    parser = argparse.ArgumentParser(description='Modular Prot-B-GAN with Complete Saving System')
     
     # Data paths
     parser.add_argument('--data_root', type=str, required=True, help='Root directory containing data files')
@@ -1704,7 +2004,7 @@ def main():
     
     # Embedding initialization
     parser.add_argument('--embedding_init', type=str, default='rgcn', 
-                     choices=['rgcn', 'random', 'transe', 'distmult', 'complex'], 
+                     choices=['rgcn', 'preloaded', 'random', 'transe', 'distmult', 'complex'], 
                      help='Embedding initialization method')
     parser.add_argument('--reward_scoring_method', type=str, default='distmult',
                         choices=['distmult', 'transe', 'auto'],
@@ -1715,7 +2015,7 @@ def main():
     parser.add_argument('--rgcn_lr', type=float, default=0.01, help='R-GCN learning rate')
     parser.add_argument('--rgcn_layers', type=int, default=2, help='R-GCN layers')
     parser.add_argument('--rgcn_l2_penalty', type=float, default=0.01, help='R-GCN L2 penalty')
-    parser.add_argument('--rgcn_early_stopping_patience', type=int, default=15, help='R-GCN early stopping patience')
+    parser.add_argument('--rgcn_early_stopping_patience', type=int, default=50, help='R-GCN early stopping patience')
 
     # TransE specific parameters
     parser.add_argument('--transe_epochs', type=int, default=100, help='TransE training epochs')
@@ -1775,29 +2075,35 @@ def main():
     parser.add_argument('--max_test_samples', type=int, default=4000, help='Max test samples in debug mode')
     parser.add_argument('--max_debug_steps', type=int, default=200, help='Max steps per epoch in debug mode')
     
+    # Utility options
+    parser.add_argument('--save_embeddings_only', action='store_true', help='Only create and save initial embeddings, then exit')
+    parser.add_argument('--inference_mode', action='store_true', help='Load existing model for inference only')
+    
     args = parser.parse_args()
     
-    print(f"MODULAR PROT-B-GAN with EXACT R-GCN + DISTMULT (UPDATED)")
-    print(f"  Embedding Init: {args.embedding_init.upper()} (Paper-Exact Methodology)")
+    print(f"MODULAR PROT-B-GAN WITH COMPLETE SAVING SYSTEM")
+    print(f"  Embedding Init: {args.embedding_init.upper()}")
     print(f"  Reward Method: {args.reward_scoring_method.upper()}")
     print(f"  Display Mode: {args.display_mode}")
     print(f"  Detailed Metrics: {args.detailed_metrics}")
     print(f"  Debug Mode: {args.debug}")
+    print(f"  Save Only Mode: {args.save_embeddings_only}")
     
     # Run training
     results = train_modular_prot_b_gan(args)
     
     if results:
-        print(f"\nSUCCESS! Complete Pipeline Training Completed")
+        print(f"\Training Completed")
         print(f"Best validation Hit@10: {results['best_val_hit10']:.4f}")
         print(f"R-GCN Baseline Test Hit@10: {results['baseline_hit_at_k'][10]:.4f}")
         print(f"Post-Warmup Test Hit@10: {results['warmup_hit_at_k'][10]:.4f}")
         print(f"Final Test Hit@10: {results['test_hit_at_k'][10]:.4f}")
         print(f"Total Improvement: {results['test_hit_at_k'][10] - results['baseline_hit_at_k'][10]:+.4f}")
-        print(f"Models saved to: {args.output_dir}")
+        print(f"All models and embeddings saved to: {args.output_dir}")
+        print(f"Dataset files saved with prefix: {results['dataset_prefix']}")
         return 0
     else:
-        print(f"Training failed")
+        print(f" Training failed")
         return 1
 
 if __name__ == "__main__":
